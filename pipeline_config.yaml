@@ -1,0 +1,77 @@
+# Quantitative Pipeline Configuration
+
+pipeline:
+  name: "V4_Config_Driven_Pipeline"
+  
+  # 数据源配置
+  data:
+    sources:
+      - "BaostockSource"  # 优先级1，也可以写 MockSource
+    cache_dir: "data/cache"
+    
+    # 股票池配置 (如果指定了 symbols，则优先使用 symbols，忽略 pool 配置)
+    symbols: [] # 为空则使用 pool 过滤
+    pool:
+      board: "all"        # 跑全市场 A 股
+      exchange: "all"     
+      max_count: 50       # 为了跑得快点，这里限制前 50 只（如果要全市场，设为0，但这会下载很久）
+
+  # 时间窗口配置
+  windows:
+    # 训练时间段: 2025年12月到2026年2月
+    train:
+      - start: "2025-12-01"
+        end: "2026-02-28"
+    # 回测/评测时间段: 2026年3月
+    backtest:
+      start: "2026-03-01"
+      end: "2026-03-17"
+
+  # 特征工程配置
+  features:
+    - name: "MarketFactor"
+      params:
+        index_symbol: "sh.000300"
+    - name: "BoardFactor"
+      params:
+        encode_method: "category"
+    - name: "FinancialFactor"
+      params: {}
+    - name: "FundFlowFactor"
+      params: {}
+    - name: "PandasTAFactor"
+      params: 
+        strategy: "custom"
+        features: ['BBU_5_2.0_2.0', 'BBL_5_2.0_2.0', 'fin_net_profit', 'MACDs_12_26_9', 'MACD_12_26_9', 'main_net_inflow', 'fin_yoy_ni', 'D_9_3', 'MACDh_12_26_9', 'BBM_5_2.0_2.0', 'J_9_3', 'BBB_5_2.0_2.0', 'ATRr_14', 'SMA_10', 'main_net_ratio', 'fin_roe', 'RSI_14', 'OBV', 'BBP_5_2.0_2.0', 'super_net_ratio', 'K_9_3', 'benchmark_close']
+    - name: "LabelGenerator"
+      params: 
+        horizon: 3  # 预测未来3日收益率
+        # 目标类型可选:
+        # 'regression' : 预测具体的收益率数值 (对应 model objective: reg:squarederror)
+        # 'binary' : 预测涨跌 (只输出1和0，对应 model objective: binary:logistic)
+        # 'classification_3' : 预测大涨(1)、平盘(0)、大跌(-1) (对应 model objective: multi:softmax, num_class: 3)
+        # 'excess_return_binary' : 预测是否跑赢沪深300 (1表示跑赢，0表示跑输)
+        # 'rank_pct' : 截面收益率百分比排名(0.0~1.0)，配合 rank:pairwise 效果最好，能解决二分类梯度为0的问题
+        target_type: "rank_pct"
+
+  # 模型配置
+  model:
+    name: "XGBoostWrapper"
+    params:
+      # 如果 target_type 是 excess_return_binary，可以使用 binary:logistic
+      # 如果 target_type 是 rank_pct，强烈建议使用 'rank:pairwise'
+      objective: "rank:pairwise"
+      max_depth: 4
+      eta: 0.1
+    save_path: "models/saved/config_xgb.json"
+
+  # 策略与回测配置
+  strategy:
+    name: "MLStrategy"
+    params:
+      top_k: 2
+      rebalance_period: 1
+      use_market_filter: true     # 开启大盘趋势过滤（大盘跌破20日线空仓）
+      max_turnover: 0.5           # 每次调仓最多换掉 50% 的仓位
+      weight_method: "score"      # 'equal' (等权) 或 'score' (按预测分数加权)
+    initial_capital: 100000.0

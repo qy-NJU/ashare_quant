@@ -1,0 +1,8 @@
+akshare
+pandas
+numpy
+matplotlib
+seaborn
+tushare
+backtrader
+mplfinance

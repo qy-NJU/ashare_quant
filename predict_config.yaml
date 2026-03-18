@@ -1,0 +1,47 @@
+# Quantitative Pipeline Configuration - Prediction Mode
+
+pipeline:
+  name: "V4_Real_Time_Prediction"
+  mode: "inference"  # 新增模式：推理/实盘预测
+  
+  # 数据源配置
+  data:
+    sources:
+      - "AkShareSource"
+    cache_dir: "data/cache"
+    pool:
+      board: "main"
+      exchange: "sh"
+      max_count: 5 # 极速演示模式
+
+  # 特征工程配置 (必须与训练时完全一致！)
+  features:
+    - name: "MarketFactor"
+      params:
+        index_symbol: "sh.000300"
+    - name: "BoardFactor"
+      params:
+        encode_method: "category"
+    - name: "FinancialFactor"
+      params: {}
+    - name: "FundFlowFactor"
+      params: {}
+    - name: "PandasTAFactor"
+      params: 
+        strategy: "custom"
+        # 必须使用训练时筛选出的精简因子集
+        features: ['BBU_5_2.0_2.0', 'BBL_5_2.0_2.0', 'fin_net_profit', 'MACDs_12_26_9', 'MACD_12_26_9', 'main_net_inflow', 'fin_yoy_ni', 'D_9_3', 'MACDh_12_26_9', 'BBM_5_2.0_2.0', 'J_9_3', 'BBB_5_2.0_2.0', 'ATRr_14', 'SMA_10', 'main_net_ratio', 'fin_roe', 'RSI_14', 'OBV', 'BBP_5_2.0_2.0', 'super_net_ratio', 'K_9_3', 'benchmark_close']
+    # LabelGenerator 在推理模式下不需要，因为我们不知道未来的标签
+
+  # 模型配置
+  model:
+    name: "XGBoostWrapper"
+    # 加载之前训练好的模型
+    load_path: "models/saved/config_xgb.json"
+
+  # 策略配置
+  strategy:
+    name: "MLStrategy"
+    params:
+      top_k: 10                   # 选出 Top 10
+      use_market_filter: true     # 开启大盘风控 (如果大盘跌破趋势线，可能不推荐买入)

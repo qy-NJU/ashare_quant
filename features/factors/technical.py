@@ -1,0 +1,94 @@
+from .base_factor import BaseFactor
+import pandas as pd
+import numpy as np
+
+class TechnicalFactors(BaseFactor):
+    """
+    Collection of technical analysis factors.
+    """
+    def __init__(self):
+        super().__init__("TechnicalFactors")
+
+    def calculate(self, df):
+        # This implementation calculates multiple factors and returns a DataFrame
+        result = pd.DataFrame(index=df.index)
+        
+        # Simple Moving Averages
+        result['ma5'] = df['close'].rolling(window=5).mean()
+        result['ma20'] = df['close'].rolling(window=20).mean()
+        
+        # Momentum (Rate of Change)
+        result['roc5'] = df['close'].pct_change(periods=5)
+        
+        # Volatility
+        result['vol20'] = df['close'].pct_change().rolling(window=20).std()
+        
+        return result
+
+class LabelGenerator(BaseFactor):
+    """
+    Generates labels for supervised learning (e.g., future return).
+    """
+    def __init__(self, horizon=5, target_type='regression'):
+        """
+        Args:
+            horizon (int): Number of days to look ahead.
+            target_type (str): Type of label to generate.
+                - 'regression': Continuous future return (e.g., 0.025 for 2.5% up).
+                - 'binary': 1 if return > 0 else 0.
+                - 'classification_3': 1 (up > 1%), 0 (flat), -1 (down < -1%).
+                - 'excess_return_binary': 1 if stock return > benchmark return, else 0.
+                - 'rank_pct': Cross-sectional percentage rank of returns (0.0 to 1.0). Best for rank:pairwise.
+        """
+        super().__init__("LabelGenerator")
+        self.horizon = horizon
+        self.target_type = target_type
+
+    def calculate(self, df):
+        # Calculate future return over horizon
+        future_close = df['close'].shift(-self.horizon)
+        current_close = df['close']
+        
+        # Raw return: (Future - Current) / Current
+        raw_return = (future_close / current_close) - 1
+        
+        if self.target_type == 'regression':
+            label = raw_return
+        elif self.target_type == 'rank_pct':
+            # Note: Groupby date ranking should ideally be done AFTER combining all stocks.
+            # But since calculate() runs per stock, we temporarily return raw_return here.
+            # The actual cross-sectional ranking MUST be done in runner.py before training.
+            # We flag this by returning the raw_return and handling it globally later.
+            label = raw_return
+        elif self.target_type == 'binary':
+            # 1 if positive return, 0 otherwise
+            label = (raw_return > 0).astype(int)
+            # Preserve NaNs from the shift
+            label = label.where(raw_return.notna(), np.nan)
+        elif self.target_type == 'classification_3':
+            # 1 for > 1% up, -1 for < -1% down, 0 otherwise
+            conditions = [
+                (raw_return > 0.01),
+                (raw_return < -0.01)
+            ]
+            choices = [1, -1]
+            label = pd.Series(np.select(conditions, choices, default=0), index=df.index)
+            label = label.where(raw_return.notna(), np.nan)
+        elif self.target_type == 'excess_return_binary':
+            # Expecting 'benchmark_close' to be merged into df before this step, or we approximate 
+            # by requiring it. If not present, fallback to absolute return.
+            if 'benchmark_close' in df.columns:
+                future_bm_close = df['benchmark_close'].shift(-self.horizon)
+                current_bm_close = df['benchmark_close']
+                bm_return = (future_bm_close / current_bm_close) - 1
+                excess_return = raw_return - bm_return
+                label = (excess_return > 0).astype(int)
+                label = label.where(raw_return.notna() & bm_return.notna(), np.nan)
+            else:
+                print("Warning: 'benchmark_close' not found. Falling back to absolute binary return.")
+                label = (raw_return > 0).astype(int)
+                label = label.where(raw_return.notna(), np.nan)
+        else:
+            raise ValueError(f"Unsupported target_type: {self.target_type}")
+            
+        return label.rename(f'target_{self.horizon}d')

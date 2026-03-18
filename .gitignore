@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data & Cache
+data/cache/
+data/predictions/
+data/analysis/
+*.parquet
+*.csv
+
+# Models
+models/saved/
+*.json
+*.model
+
+# IDEs
+.vscode/
+.idea/
+.DS_Store
