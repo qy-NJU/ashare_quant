@@ -39,11 +39,8 @@ class PipelineRunner:
     def build_data_layer(self):
         print("Building Data Layer...")
         data_cfg = self.config['data']
-        sources = []
-        for src_name in data_cfg['sources']:
-            sources.append(self._instantiate_class(src_name))
-        
-        return DataRepository(sources, cache_dir=data_cfg.get('cache_dir', 'data/cache'))
+        # For Local Data Lake, sources are deprecated but kept in config for compatibility
+        return DataRepository(cache_dir=data_cfg.get('cache_dir', 'data/local_lake'))
 
     def build_feature_pipeline(self, include_label=True):
         print(f"Building Feature Pipeline (include_label={include_label})...")

@@ -74,9 +74,9 @@ pip install pandas numpy xgboost scikit-learn baostock akshare pandas-ta pyyaml 
 ```
 
 ### 2. 运行模型训练与回测
-编辑 `pipeline_config.yaml`，设定您想要的数据范围、因子组合和模型参数，然后执行：
+编辑 `configs/pipeline_config.yaml`，设定您想要的数据范围、因子组合和模型参数，然后执行：
 ```bash
-python runner.py pipeline_config.yaml
+python runner.py configs/pipeline_config.yaml
 ```
 系统将自动：
 1. 下载并缓存数据
@@ -94,15 +94,14 @@ python analyze_importance.py
 ### 4. 生成实盘预测 (Inference)
 当模型训练完毕后，使用推理配置文件进行最新数据的预测：
 ```bash
-python runner.py predict_config.yaml
+python runner.py configs/predict_config.yaml
 ```
-系统会拉取最近的数据，跳过训练，直接输出明日的预测打分及推荐买入列表。
 
 ---
 
 ## ⚙️ 配置指南 (Configuration Guide)
 
-`pipeline_config.yaml` 是整个框架的“遥控器”。以下是关键配置项说明：
+`configs/pipeline_config.yaml` 是整个框架的“遥控器”。以下是关键配置项说明：
 
 ### 数据与股票池 (`data`)
 ```yaml

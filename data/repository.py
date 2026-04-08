@@ -1,77 +1,75 @@
 import pandas as pd
 import os
-from .source.base_source import BaseDataSource
+import sys
 
 class DataRepository:
     """
     Central repository for accessing data.
-    Handles Parquet caching and failover between sources.
+    Loads data exclusively from the local Data Lake (Parquet files).
+    No on-the-fly downloading to ensure stability and performance.
     """
-    def __init__(self, sources, cache_dir='data/cache'):
+    def __init__(self, sources=None, cache_dir='data/local_lake'):
         """
         Args:
-            sources (list): List of BaseDataSource instances, ordered by priority.
-            cache_dir (str): Directory to store Parquet files.
+            sources (list): Deprecated. Ignored in this version.
+            cache_dir (str): Root directory of the local Data Lake.
         """
-        self.sources = sources
         self.cache_dir = cache_dir
-        if not os.path.exists(self.cache_dir):
-            os.makedirs(self.cache_dir)
+        self.daily_k_dir = os.path.join(self.cache_dir, 'daily_k')
+        self.basics_dir = os.path.join(self.cache_dir, 'basics')
+        
+        if not os.path.exists(self.daily_k_dir):
+            print(f"Warning: Local Data Lake directory '{self.daily_k_dir}' does not exist.")
+            print("Please run `python scripts/sync_data.py` first to populate local data.")
 
     def get_stock_list(self):
-        # We don't necessarily cache stock list as it's small, or we can use a simple CSV
-        cache_file = os.path.join(self.cache_dir, 'stock_list.parquet')
+        """
+        Load stock list from local Data Lake.
+        """
+        cache_file = os.path.join(self.basics_dir, 'stock_list.parquet')
         
-        # Try load cache if it's recent (simplified: just load if exists)
         if os.path.exists(cache_file):
             try:
                 return pd.read_parquet(cache_file)
-            except:
-                pass
-
-        for source in self.sources:
-            try:
-                df = source.get_stock_list()
-                if not df.empty:
-                    df.to_parquet(cache_file, engine='pyarrow', index=False)
-                    return df
             except Exception as e:
-                print(f"Source {source.name} failed: {e}")
-                continue
-        print("All data sources failed to get stock list.")
+                print(f"Error reading local stock list: {e}")
+                
+        print(f"Stock list not found at {cache_file}.")
+        print("Please run `python scripts/sync_data.py` to sync basic data.")
         return pd.DataFrame()
 
     def get_daily_data(self, symbol, start_date, end_date, adjust='qfq'):
         """
-        Try to load from Parquet cache first. If missing or incomplete, fetch from sources.
-        For simplicity in this implementation, we cache by year-month or full request.
-        Here we cache the specific request for demonstration.
+        Load historical daily data from the local Parquet Data Lake and slice it by date.
         """
-        cache_file = os.path.join(self.cache_dir, f"{symbol}_{start_date}_{end_date}_{adjust}.parquet")
+        cache_file = os.path.join(self.daily_k_dir, f"{symbol}.parquet")
         
-        if os.path.exists(cache_file):
-            try:
-                # print(f"Loading {symbol} from Parquet cache...")
-                df = pd.read_parquet(cache_file)
-                # If index was saved as column during to_parquet, set it back
-                if 'date' in df.columns:
-                    df = df.set_index('date')
+        if not os.path.exists(cache_file):
+            # We don't download on-the-fly anymore. Just return empty DataFrame.
+            # print(f"Warning: No local data found for {symbol}. Run sync_data.py to download.")
+            return pd.DataFrame()
+            
+        try:
+            # Load full history from local parquet (very fast)
+            df = pd.read_parquet(cache_file)
+            
+            if df.empty:
                 return df
-            except Exception as e:
-                print(f"Failed to load cache for {symbol}: {e}")
-
-        # Fetch from sources
-        for source in self.sources:
-            try:
-                df = source.get_daily_data(symbol, start_date, end_date, adjust)
-                if not df.empty:
-                    # Save to cache
-                    # Reset index to save 'date' column in Parquet
-                    df_to_save = df.reset_index()
-                    df_to_save.to_parquet(cache_file, engine='pyarrow', index=False)
-                    return df
-            except Exception as e:
-                print(f"Source {source.name} failed for {symbol}: {e}")
-                continue
                 
-        return pd.DataFrame()
+            # Set index if needed
+            if 'date' in df.columns:
+                df['date'] = pd.to_datetime(df['date'])
+                df = df.set_index('date')
+                
+            # Convert string dates to datetime for slicing
+            start_dt = pd.to_datetime(start_date)
+            end_dt = pd.to_datetime(end_date)
+            
+            # Slice the requested date range
+            sliced_df = df.loc[start_dt:end_dt]
+            
+            return sliced_df
+            
+        except Exception as e:
+            print(f"Failed to load/slice local data for {symbol}: {e}")
+            return pd.DataFrame()

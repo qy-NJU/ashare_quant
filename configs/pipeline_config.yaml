@@ -6,26 +6,26 @@ pipeline:
   # 数据源配置
   data:
     sources:
-      - "BaostockSource"  # 优先级1，也可以写 MockSource
-    cache_dir: "data/cache"
+      - "BaostockSource"  # 已弃用，数据统一从 Local Data Lake 加载
+    cache_dir: "data/local_lake"
     
     # 股票池配置 (如果指定了 symbols，则优先使用 symbols，忽略 pool 配置)
     symbols: [] # 为空则使用 pool 过滤
     pool:
       board: "all"        # 跑全市场 A 股
       exchange: "all"     
-      max_count: 50       # 为了跑得快点，这里限制前 50 只（如果要全市场，设为0，但这会下载很久）
+      max_count: 10       # 为了跑得快点，这里限制前 10 只（如果要全市场，设为0，但这会下载很久）
 
   # 时间窗口配置
   windows:
     # 训练时间段: 2025年12月到2026年2月
     train:
-      - start: "2025-12-01"
-        end: "2026-02-28"
+      - start: "2023-01-01"
+        end: "2023-06-30"
     # 回测/评测时间段: 2026年3月
     backtest:
-      start: "2026-03-01"
-      end: "2026-03-17"
+      start: "2023-07-01"
+      end: "2023-07-31"
 
   # 特征工程配置
   features:
