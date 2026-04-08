@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from models.xgboost_model import XGBoostWrapper
 
-def analyze_importance(config_path="pipeline_config.yaml"):
+def analyze_importance(config_path="configs/pipeline_config.yaml"):
     print("--- Analyzing Feature Importance ---")
     
     with open(config_path, 'r', encoding='utf-8') as f:

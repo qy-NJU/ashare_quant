@@ -42,7 +42,7 @@ class MLStrategy(BaseStrategy):
         try:
             # Using a mock broad index symbol or fetch from repo
             # In a real system, you'd fetch "000300" (HS300)
-            df = data_loader.get_daily_data("000300", 
+            df = data_loader.get_daily_data("sh.000300", 
                                             start_date=(pd.to_datetime(date) - pd.Timedelta(days=40)).strftime('%Y%m%d'), 
                                             end_date=date)
             if len(df) < 20:

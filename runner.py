@@ -316,7 +316,7 @@ class PipelineRunner:
 import sys
 
 if __name__ == "__main__":
-    config_file = "pipeline_config.yaml"
+    config_file = "configs/pipeline_config.yaml"
     if len(sys.argv) > 1:
         config_file = sys.argv[1]
     runner = PipelineRunner(config_file)

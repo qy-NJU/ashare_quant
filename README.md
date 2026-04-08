@@ -11,13 +11,16 @@ A-Share Quant 是一个基于 Python 的工业级、配置驱动 (Config-driven)
 
 ## 🌟 核心特性 (Features)
 
-- **⚙️ YAML 配置驱动**: 告别硬编码！通过修改 `pipeline_config.yaml` 即可切换数据源、调整时间窗口、开启/关闭因子、修改模型参数，实现极简的策略实验。
+- **⚙️ YAML 配置驱动**: 告别硬编码！通过修改 `configs/pipeline_config.yaml` 即可切换数据源、调整时间窗口、开启/关闭因子、修改模型参数，实现极简的策略实验。
 - **🔌 模块化架构**:
   - **数据层 (Data)**: 支持 Baostock、AkShare 多源数据接入，内置本地 Parquet 高速缓存与基于 `StockPoolManager` 的灵活板块过滤（如全市场、沪深300、创业板）。
-  - **特征工程 (Features)**: 支持 130+ 种 `pandas-ta` 技术指标、财务基本面因子（ROE、净利润增长等）、资金流向因子及大盘宏观特征。
+  - **特征工程 (Features)**: 支持 130+ 种 `pandas-ta` 技术指标、财务基本面因子（ROE、净利润增长等）、资金流向因子及大盘宏观特征。彻底消除了 LabelGenerator 中的未来函数，采用 T+1 开盘价作为真实交易成本基准。
   - **模型层 (Models)**: 原生集成 XGBoost，支持**增量学习 (Incremental Learning)**、**类别特征原生处理 (Categorical Support)** 以及专业的**排序学习 (Learning to Rank - pairwise)**。
-  - **策略与回测 (Strategy & Backtest)**: 内置基于预测分数的 Top-K 选股策略，支持大盘风控过滤、换手率控制及基于预测分数的资金加权分配。
-- **🔮 实盘预测模式**: 提供专门的 `predict_config.yaml` 和推理模式，一键输出“明日十大金股”。
+  - **策略与回测 (Strategy & Backtest)**: 
+    - **严谨的 T+1 交易引擎**: 信号在 T 日收盘后生成，并在 T+1 日开盘价执行。
+    - **A 股特色机制**: 完美支持涨跌停（Limit Up/Down）过滤（涨停不买、跌停不卖），内置滑点（Slippage）与 A股真实印花税（单边万分之五）计算，挤出回测水分。
+    - **进阶风控**: 支持大盘风控过滤（如跌破20日线空仓）、换手率控制及基于预测分数的资金加权分配。
+- **🔮 实盘预测模式**: 提供专门的 `configs/predict_config.yaml` 和推理模式，一键输出“明日十大金股”。
 
 ---
 
@@ -25,6 +28,9 @@ A-Share Quant 是一个基于 Python 的工业级、配置驱动 (Config-driven)
 
 ```text
 ashare_quant/
+├── configs/                    # ⚙️ 配置文件目录
+│   ├── pipeline_config.yaml    # 训练与回测配置文件
+│   └── predict_config.yaml     # 实盘推理配置文件
 ├── data/                       # 数据接入与管理层
 │   ├── source/                 # 具体数据源实现 (Baostock, AkShare)
 │   ├── cache/                  # Parquet 格式的本地数据缓存
@@ -49,8 +55,7 @@ ashare_quant/
 ├── backtest/                   # 回测引擎层
 │   └── engine.py               # 事件驱动的回测与撮合逻辑
 ├── runner.py                   # 🌟 核心引擎：配置解析与流水线执行器
-├── pipeline_config.yaml        # 训练与回测配置文件
-└── predict_config.yaml         # 实盘推理配置文件
+└── analyze_importance.py       # 因子重要性分析工具
 ```
 
 ---

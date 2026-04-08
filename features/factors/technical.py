@@ -45,12 +45,20 @@ class LabelGenerator(BaseFactor):
         self.target_type = target_type
 
     def calculate(self, df):
-        # Calculate future return over horizon
-        future_close = df['close'].shift(-self.horizon)
-        current_close = df['close']
+        # Calculate future return over horizon. 
+        # To avoid lookahead bias and align with T+1 open execution:
+        # Trade is executed at T+1 open, and evaluated at T+horizon close.
+        # Return = (Close_{T+horizon} / Open_{T+1}) - 1
         
-        # Raw return: (Future - Current) / Current
-        raw_return = (future_close / current_close) - 1
+        if 'open' not in df.columns:
+            # Fallback if open price is not available
+            future_close = df['close'].shift(-self.horizon)
+            entry_price = df['close']
+        else:
+            future_close = df['close'].shift(-self.horizon)
+            entry_price = df['open'].shift(-1)
+            
+        raw_return = (future_close / entry_price) - 1
         
         if self.target_type == 'regression':
             label = raw_return
