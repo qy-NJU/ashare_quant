@@ -13,8 +13,8 @@
 
 ### 1. 极限情绪因子：涨停与溢价 (Limit-up & Premium)
 A 股的涨跌停制度是情绪的放大器。我们需要刻画股票最近是否处于极端情绪中。
-- **is_limit_up**: 当日是否涨停。逻辑：`close >= round(pre_close * 1.095, 2)`（简化版，暂不考虑 20% 的科创/创业板，统一按 10% 近似）。
-- **is_limit_down**: 当日是否跌停。逻辑：`close <= round(pre_close * 0.905, 2)`。
+- **is_limit_up**: 当日是否涨停。逻辑：精确区分主板（10%）和科创/创业板（20%）。通过股票代码前缀（如 `300`/`688`）动态判定。
+- **is_limit_down**: 当日是否跌停。逻辑：同上，精确区分 10% 和 20% 跌停。
 - **high_premium_tags**: 昨日最高溢价。逻辑：`high / pre_close - 1`。如果昨天涨停，今天的最高溢价能反映承接力度。
 
 ### 2. 资金共识因子：换手突破 (Turnover Breakout)
@@ -31,6 +31,7 @@ A 股的涨跌停制度是情绪的放大器。我们需要刻画股票最近是
 ### 4. 预期差因子：弱转强 (Weak to Strong)
 这是短线超额收益的核心。昨天烂板或长上影（弱），今天却大幅高开（强）。
 - **weak_to_strong_signal**: 弱转强特征。逻辑：昨日留下长上影线（`upper_shadow_ratio > 0.03`）且放量，但今日开盘超预期强势（`open > pre_close * 1.02`）。
+- **excess_return_hs300**: 相对强弱。逻辑：计算个股收益率减去当日 `sh.000300` 收益率，连续多日取得超额正收益说明个股脱离大盘具有独立逻辑。
 
 ## 三、 架构接入 (Architecture Integration)
 
@@ -40,7 +41,7 @@ A 股的涨跌停制度是情绪的放大器。我们需要刻画股票最近是
 2. **修改 `configs/pipeline_config.yaml`**：
    - 在 `features` 列表中注册 `SubjectiveFactor`，使其随流水线自动执行。
 3. **兼容性处理**：
-   - 这些因子产生的空值（如 rolling 产生的开端 NaN）将由现有的 pipeline 自动处理。
+   - 这些因子产生的空值（如 rolling 产生的开端 NaN）将**保留为 NaN**，由 XGBoost 的内置缺失值机制自行处理，并在 `CrossSectionalProcessor` 中做针对 NaN 的跳过逻辑。
    - 产生的绝对数值因子（如 `vol_breakout_ratio`）将完美受益于上一阶段刚刚完成的 **MAD 去极值和 Z-Score 标准化**，消除极端离群值的干扰。
 
 ## 四、 验证步骤 (Verification Steps)

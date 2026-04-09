@@ -12,6 +12,7 @@ from data.pool_manager import StockPoolManager
 from features.pipeline import FeaturePipeline
 from features.factors.pandas_ta_factor import PandasTAFactor
 from features.factors.fundamental import BoardFactor
+from features.factors.event_driven import EventFactor
 from features.factors.financial import FinancialFactor
 from features.factors.fund_flow import FundFlowFactor
 from features.factors.market import MarketFactor

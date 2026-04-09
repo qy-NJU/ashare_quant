@@ -9,12 +9,16 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.source.baostock_source import BaostockSource
 
+import akshare as ak
+
 LOCAL_LAKE_DIR = 'data/local_lake'
 DAILY_K_DIR = os.path.join(LOCAL_LAKE_DIR, 'daily_k')
 BASICS_DIR = os.path.join(LOCAL_LAKE_DIR, 'basics')
+EVENTS_DIR = os.path.join(LOCAL_LAKE_DIR, 'events')
 
 os.makedirs(DAILY_K_DIR, exist_ok=True)
 os.makedirs(BASICS_DIR, exist_ok=True)
+os.makedirs(EVENTS_DIR, exist_ok=True)
 
 def sync_stock_list(source):
     print("Syncing A-share stock list...")
@@ -87,6 +91,51 @@ def sync_daily_data_for_symbol(source, symbol, start_date='2015-01-01', end_date
     except Exception as e:
         print(f"[{symbol}] Failed to fetch data: {e}")
 
+def sync_lhb_data(start_date='20200101', end_date=None):
+    """
+    Sync Longhu Bang (Dragon Tiger List / Institutional & Hot Money trading) data from AkShare.
+    """
+    if end_date is None:
+        end_date = datetime.datetime.now().strftime('%Y%m%d')
+        
+    print(f"Syncing Longhu Bang (LHB) data from {start_date} to {end_date}...")
+    save_path = os.path.join(EVENTS_DIR, 'lhb_data.parquet')
+    
+    local_df = pd.DataFrame()
+    if os.path.exists(save_path):
+        try:
+            local_df = pd.read_parquet(save_path)
+            if not local_df.empty:
+                last_date = pd.to_datetime(local_df['上榜日期']).max().strftime('%Y%m%d')
+                if last_date >= end_date:
+                    print("LHB data is already up to date.")
+                    return
+                # Start fetching from the day after the last date
+                start_date = (pd.to_datetime(last_date) + pd.Timedelta(days=1)).strftime('%Y%m%d')
+                print(f"Incremental LHB sync from {start_date} to {end_date}")
+        except Exception as e:
+            print(f"Failed to read local LHB parquet, doing full sync. Error: {e}")
+            
+    # Fetch from AkShare
+    try:
+        # stock_lhb_detail_em returns data for a specific date range
+        new_df = ak.stock_lhb_detail_em(start_date=start_date, end_date=end_date)
+        
+        if not new_df.empty:
+            if not local_df.empty:
+                combined_df = pd.concat([local_df, new_df])
+                combined_df = combined_df.drop_duplicates(subset=['上榜日期', '代码'], keep='last')
+                combined_df = combined_df.sort_values('上榜日期')
+            else:
+                combined_df = new_df
+                
+            combined_df.to_parquet(save_path, engine='pyarrow', index=False)
+            print(f"LHB Sync complete. Saved {len(new_df)} new rows. Total: {len(combined_df)}")
+        else:
+            print("No new LHB data found.")
+    except Exception as e:
+        print(f"Failed to fetch LHB data: {e}")
+
 def sync_all_daily_data(symbols_limit=None):
     source = BaostockSource()
     
@@ -126,6 +175,10 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Sync A-Share data to Local Data Lake")
     parser.add_argument('--limit', type=int, default=None, help='Limit number of symbols to sync (for testing)')
+    parser.add_argument('--events_only', action='store_true', help='Only sync event data like LHB')
     args = parser.parse_args()
     
-    sync_all_daily_data(symbols_limit=args.limit)
+    sync_lhb_data()
+    
+    if not args.events_only:
+        sync_all_daily_data(symbols_limit=args.limit)

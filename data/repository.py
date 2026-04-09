@@ -17,6 +17,7 @@ class DataRepository:
         self.cache_dir = cache_dir
         self.daily_k_dir = os.path.join(self.cache_dir, 'daily_k')
         self.basics_dir = os.path.join(self.cache_dir, 'basics')
+        self.events_dir = os.path.join(self.cache_dir, 'events')
         
         if not os.path.exists(self.daily_k_dir):
             print(f"Warning: Local Data Lake directory '{self.daily_k_dir}' does not exist.")
@@ -38,6 +39,31 @@ class DataRepository:
         print("Please run `python scripts/sync_data.py` to sync basic data.")
         return pd.DataFrame()
 
+    def get_lhb_data(self, start_date=None, end_date=None):
+        """
+        Load Longhu Bang (Dragon Tiger List) event data from local Parquet Data Lake.
+        """
+        cache_file = os.path.join(self.events_dir, 'lhb_data.parquet')
+        
+        if not os.path.exists(cache_file):
+            return pd.DataFrame()
+            
+        try:
+            df = pd.read_parquet(cache_file)
+            if df.empty:
+                return df
+                
+            df['上榜日期'] = pd.to_datetime(df['上榜日期'])
+            
+            if start_date:
+                df = df[df['上榜日期'] >= pd.to_datetime(start_date)]
+            if end_date:
+                df = df[df['上榜日期'] <= pd.to_datetime(end_date)]
+                
+            return df
+        except Exception as e:
+            print(f"Failed to load local LHB data: {e}")
+            return pd.DataFrame()
     def get_daily_data(self, symbol, start_date, end_date, adjust='qfq'):
         """
         Load historical daily data from the local Parquet Data Lake and slice it by date.
