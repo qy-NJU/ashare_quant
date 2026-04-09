@@ -16,6 +16,7 @@ from features.factors.financial import FinancialFactor
 from features.factors.fund_flow import FundFlowFactor
 from features.factors.market import MarketFactor
 from features.factors.technical import LabelGenerator
+from features.processor import CrossSectionalProcessor, DynamicFilter
 from models.xgboost_model import XGBoostWrapper
 from models.machine_learning import SklearnWrapper
 from strategies.ml_strategy import MLStrategy
@@ -85,11 +86,12 @@ class PipelineRunner:
         if 'pool' in data_cfg:
             pool_cfg = data_cfg['pool']
             print(f"Using StockPoolManager with config: {pool_cfg}")
-            pool_manager = StockPoolManager()
+            pool_manager = StockPoolManager(data_repo=self.build_data_layer())
             return pool_manager.get_filtered_symbols(
                 board=pool_cfg.get('board'),
                 exchange=pool_cfg.get('exchange'),
-                max_count=pool_cfg.get('max_count')
+                max_count=pool_cfg.get('max_count'),
+                exclude_st=pool_cfg.get('exclude_st', True)
             )
             
         print("No symbols or pool config found. Returning empty list.")
@@ -107,6 +109,18 @@ class PipelineRunner:
             return
             
         model = self.build_model()
+        
+        # Build processor and dynamic filter
+        prep_cfg = self.config.get('preprocessing', {})
+        use_mad = prep_cfg.get('mad_clip', True)
+        use_zscore = prep_cfg.get('z_score', True)
+        processor = CrossSectionalProcessor(use_mad_clip=use_mad, use_zscore=use_zscore)
+        
+        filter_cfg = prep_cfg.get('dynamic_filter', {})
+        enable_filter = filter_cfg.get('enable', True)
+        min_turnover = filter_cfg.get('min_avg_turnover', 10000000) # Default 10 million RMB
+        min_listed_days = filter_cfg.get('min_listed_days', 120)    # Default half year
+        dynamic_filter = DynamicFilter(min_avg_turnover=min_turnover, min_listed_days=min_listed_days)
         
         # --- INFERENCE MODE ---
         if mode == 'inference':
@@ -136,7 +150,14 @@ class PipelineRunner:
             # Let's fetch benchmark data once per window (sh.000300 is HS300 in Baostock)
             benchmark_df = repo.get_daily_data("sh.000300", start_date_str, end_date_str)
             
-            predictions = []
+            # --- Apply Cross-Sectional Processing on Predictions (if needed) ---
+            # Wait, prediction features should be cross-sectionally processed!
+            # Since we predict stock by stock above, cross-sectional features for the latest day are NOT calculated correctly.
+            # We must gather all latest features, process them together, then predict.
+            print("Gathering features for all symbols to apply cross-sectional processing...")
+            
+            latest_features_list = []
+            valid_symbols = []
             
             count = 0
             for sym in symbols:
@@ -147,6 +168,11 @@ class PipelineRunner:
                 # Fetch data
                 df = repo.get_daily_data(sym, start_date_str, end_date_str)
                 if df.empty or len(df) < 30: continue
+                
+                # Apply Dynamic Filter (Zombie stocks, New stocks)
+                if enable_filter:
+                    df = dynamic_filter.filter(df)
+                    if df.empty: continue
                 
                 # Merge benchmark
                 if not benchmark_df.empty:
@@ -163,24 +189,32 @@ class PipelineRunner:
                     features_df = infer_pipeline.transform(df)
                     if features_df.empty: continue
                     
-                    # Take the LATEST row for prediction (regardless of the exact date)
+                    # Take the LATEST row for prediction
                     latest_features = features_df.iloc[[-1]]
-                    latest_date = latest_features.index[-1].strftime('%Y-%m-%d')
-                    
-                    # Ensure columns match model requirement (drop non-features)
-                    X_pred = latest_features.drop(columns=['open', 'high', 'low', 'close', 'volume', 'date', 'symbol'], errors='ignore')
-                    
-                    # Predict
-                    score = model.predict(X_pred)[0]
-                    predictions.append({'symbol': sym, 'score': score, 'data_date': latest_date})
+                    latest_features_list.append(latest_features)
+                    valid_symbols.append(sym)
                 except Exception as e:
-                    # print(f"Error predicting {sym}: {e}")
                     pass
             
-            # Sort and Output
-            if not predictions:
-                print("No predictions generated. This usually means the data source returned empty data or not enough rows (min 30) for feature calculation.")
+            if not latest_features_list:
+                print("No features generated.")
                 return
+                
+            # Combine all latest features
+            X_infer_full = pd.concat(latest_features_list)
+            
+            # Apply Cross-Sectional Processing
+            feature_cols = X_infer_full.drop(columns=['open', 'high', 'low', 'close', 'volume', 'date', 'symbol'], errors='ignore').columns.tolist()
+            X_infer_full = processor.process(X_infer_full, feature_cols)
+            
+            # Predict
+            X_pred = X_infer_full[feature_cols]
+            scores = model.predict(X_pred)
+            
+            predictions = []
+            for i, sym in enumerate(valid_symbols):
+                latest_date = X_infer_full.index[i].strftime('%Y-%m-%d')
+                predictions.append({'symbol': sym, 'score': scores[i], 'data_date': latest_date})
                 
             pred_df = pd.DataFrame(predictions)
             pred_df = pred_df.sort_values('score', ascending=False)
@@ -218,6 +252,11 @@ class PipelineRunner:
                 df = repo.get_daily_data(sym, start, end)
                 if df.empty: continue
                 
+                # Apply Dynamic Filter (Zombie stocks, New stocks)
+                if enable_filter:
+                    df = dynamic_filter.filter(df)
+                    if df.empty: continue
+                
                 # Merge benchmark close if needed for excess return
                 if not benchmark_df.empty:
                     # Align by date index
@@ -250,6 +289,10 @@ class PipelineRunner:
                 
                 # Ensure X_full has unique columns
                 X_full = X_full.loc[:, ~X_full.columns.duplicated()]
+                
+                # Apply Cross-Sectional Processing (MAD + Z-Score) on Features
+                feature_cols = X_full.columns.tolist()
+                X_full = processor.process(X_full, feature_cols)
                 
                 # Check if we need to do cross-sectional percentage ranking for labels
                 label_gen_cfg = next((f for f in self.config['features'] if f['name'] == 'LabelGenerator'), None)

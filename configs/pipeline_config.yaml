@@ -14,7 +14,17 @@ pipeline:
     pool:
       board: "all"        # 跑全市场 A 股
       exchange: "all"     
+      exclude_st: true    # 是否剔除 ST/*ST/退市股，过滤垃圾股防雷
       max_count: 10       # 为了跑得快点，这里限制前 10 只（如果要全市场，设为0，但这会下载很久）
+
+  # 特征预处理配置 (去极值与标准化，减少市场噪音干扰)
+  preprocessing:
+    dynamic_filter:       # 动态过滤僵尸股与次新股
+      enable: true
+      min_avg_turnover: 10000000  # 近20日日均成交额低于 1000万 的股票将被过滤 (防止流动性陷阱)
+      min_listed_days: 120        # 上市不满 120 天的次新股将被过滤 (防止新股异动噪音)
+    mad_clip: true        # 开启 MAD 横截面去极值 (过滤暴涨暴跌的异常噪音)
+    z_score: true         # 开启 Z-Score 横截面标准化 (消除大盘Beta带来的绝对值波动)
 
   # 时间窗口配置
   windows:

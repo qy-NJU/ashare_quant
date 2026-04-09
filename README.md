@@ -32,9 +32,11 @@ ashare_quant/
 │   ├── pipeline_config.yaml    # 训练与回测配置文件
 │   └── predict_config.yaml     # 实盘推理配置文件
 ├── data/                       # 数据接入与管理层
+│   ├── local_lake/             # 🚀 本地离线数据湖 (Parquet)
+│   │   ├── basics/             # 股票基础信息
+│   │   └── daily_k/            # 个股日线全量历史数据
 │   ├── source/                 # 具体数据源实现 (Baostock, AkShare)
-│   ├── cache/                  # Parquet 格式的本地数据缓存
-│   ├── repository.py           # 统一的数据仓库入口
+│   ├── repository.py           # 统一的数据仓库入口 (从 local_lake 极速加载)
 │   ├── pool_manager.py         # 股票池过滤器 (板块、交易所过滤)
 │   └── market_manager.py       # 大盘指数与宏观数据管理
 ├── features/                   # 特征工程层 (Pipeline)
@@ -54,6 +56,8 @@ ashare_quant/
 │   └── momentum_strategy.py    # 传统动量策略示例
 ├── backtest/                   # 回测引擎层
 │   └── engine.py               # 事件驱动的回测与撮合逻辑
+├── scripts/                    # 实用脚本目录
+│   └── sync_data.py            # 🚀 离线数据湖同步脚本
 ├── runner.py                   # 🌟 核心引擎：配置解析与流水线执行器
 └── analyze_importance.py       # 因子重要性分析工具
 ```
@@ -73,25 +77,35 @@ cd ashare_quant
 pip install pandas numpy xgboost scikit-learn baostock akshare pandas-ta pyyaml pyarrow
 ```
 
-### 2. 运行模型训练与回测
+### 2. 同步本地数据湖
+由于废弃了边跑边下的旧模式，运行回测前必须通过 `sync_data.py` 将最新数据拉取到本地数据湖中。
+```bash
+# 全量同步所有 A 股日线数据 (耗时较长，建议盘后执行)
+python scripts/sync_data.py
+
+# 或者为了快速测试，只同步前 50 只股票
+python scripts/sync_data.py --limit 50
+```
+
+### 3. 运行模型训练与回测
 编辑 `configs/pipeline_config.yaml`，设定您想要的数据范围、因子组合和模型参数，然后执行：
 ```bash
 python runner.py configs/pipeline_config.yaml
 ```
 系统将自动：
-1. 下载并缓存数据
+1. 瞬间从本地 Data Lake 加载所需数据并进行内存切片
 2. 生成全量特征矩阵
 3. 训练 XGBoost 模型并保存到 `models/saved/`
 4. 在样本外时间段执行模拟回测并输出收益报告
 
-### 3. 特征重要性分析 (因子提纯)
+### 4. 特征重要性分析 (因子提纯)
 在跑完一次“全量特征”训练后，您可以分析哪些因子真正有效：
 ```bash
 python analyze_importance.py
 ```
 这会输出特征重要性排名（并保存在 `data/analysis/` 下）。您可以挑选 Top 30 的因子，将它们填入 YAML 的 `custom` 策略中进行第二轮精简训练，从而提高模型鲁棒性。
 
-### 4. 生成实盘预测 (Inference)
+### 5. 生成实盘预测 (Inference)
 当模型训练完毕后，使用推理配置文件进行最新数据的预测：
 ```bash
 python runner.py configs/predict_config.yaml

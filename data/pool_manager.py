@@ -1,15 +1,12 @@
 import pandas as pd
-from .source.baostock_source import BaostockSource
+from .repository import DataRepository
 
 class StockPoolManager:
     """
-    Manages the stock universe filtering based on board and exchange.
+    Manages the stock universe filtering based on board, exchange, and risk conditions (e.g. ST).
     """
-    def __init__(self, source=None):
-        # We use BaostockSource since AkShare might fail in the current network environment
-        # Note: Baostock query_all_stock returns all stocks but we will fetch HS300 for stability in demo
-        # For full market, we should call query_all_stock(day)
-        self.source = source if source else BaostockSource()
+    def __init__(self, data_repo=None):
+        self.data_repo = data_repo if data_repo else DataRepository()
 
     def _identify_exchange(self, code):
         if code.startswith(('60', '68', '900')):
@@ -31,19 +28,24 @@ class StockPoolManager:
             return 'bj'       # 北交所
         return 'other'
 
-    def get_filtered_symbols(self, board=None, exchange=None, max_count=None):
+    def get_filtered_symbols(self, board=None, exchange=None, max_count=None, exclude_st=True):
         """
-        Get a list of stock symbols filtered by board and exchange.
+        Get a list of stock symbols filtered by board, exchange, and ST status.
         """
-        # We will use the existing get_stock_list() which fetches HS300 in BaostockSource
-        # If you need FULL market, you can implement get_all_stocks() in BaostockSource.
-        # For demonstration and stability, we'll work with the list returned.
-        df = self.source.get_stock_list()
+        df = self.data_repo.get_stock_list()
         
         if df.empty:
-            print("Failed to fetch stock list for filtering.")
-            # Fallback to some mock symbols if network fails completely
-            df = pd.DataFrame({'symbol': ['600000', '300001', '688001', '000001']})
+            print("Failed to fetch stock list from Local Data Lake.")
+            return []
+
+        initial_count = len(df)
+
+        # Apply ST filter
+        if exclude_st and 'name' in df.columns:
+            # Exclude stocks containing 'ST', '*ST', or '退'
+            st_mask = df['name'].str.contains('ST|退', case=False, na=False)
+            df = df[~st_mask]
+            print(f"StockPoolManager: Excluded {initial_count - len(df)} ST/Delisting stocks.")
 
         df['exchange'] = df['symbol'].apply(self._identify_exchange)
         df['board'] = df['symbol'].apply(self._identify_board)
