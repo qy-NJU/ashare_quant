@@ -13,7 +13,7 @@ A-Share Quant 是一个基于 Python 的工业级、配置驱动 (Config-driven)
 
 - **⚙️ YAML 配置驱动**: 告别硬编码！通过修改 `configs/pipeline_config.yaml` 即可切换数据源、调整时间窗口、开启/关闭因子、修改模型参数，实现极简的策略实验。
 - **🔌 模块化架构**:
-  - **数据层 (Data)**: 支持 Baostock、AkShare 多源数据接入，内置本地 Parquet 高速缓存与基于 `StockPoolManager` 的灵活板块过滤（如全市场、沪深300、创业板）。
+  - **离线数据湖 (Local Data Lake)**: 彻底剥离即时网络下载请求，采用独立的 `sync_data.py` 脚本进行数据每日增量/全量同步。底层采用 Parquet 格式进行按股票全历史存储，回测时在内存中极速切片，加载速度提升万倍，不再受限于网络波动。
   - **特征工程 (Features)**: 支持 130+ 种 `pandas-ta` 技术指标、财务基本面因子（ROE、净利润增长等）、资金流向因子及大盘宏观特征。彻底消除了 LabelGenerator 中的未来函数，采用 T+1 开盘价作为真实交易成本基准。
   - **模型层 (Models)**: 原生集成 XGBoost，支持**增量学习 (Incremental Learning)**、**类别特征原生处理 (Categorical Support)** 以及专业的**排序学习 (Learning to Rank - pairwise)**。
   - **策略与回测 (Strategy & Backtest)**: 
