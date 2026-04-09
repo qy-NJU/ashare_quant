@@ -42,6 +42,8 @@ pipeline:
     - name: "MarketFactor"
       params:
         index_symbol: "sh.000300"
+    - name: "SubjectiveFactor"  # 引入主观交易逻辑量化因子 (涨停溢价、量价背离、换手突破等)
+      params: {}
     - name: "BoardFactor"
       params:
         encode_method: "category"

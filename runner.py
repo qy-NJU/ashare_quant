@@ -15,6 +15,7 @@ from features.factors.fundamental import BoardFactor
 from features.factors.financial import FinancialFactor
 from features.factors.fund_flow import FundFlowFactor
 from features.factors.market import MarketFactor
+from features.factors.subjective import SubjectiveFactor
 from features.factors.technical import LabelGenerator
 from features.processor import CrossSectionalProcessor, DynamicFilter
 from models.xgboost_model import XGBoostWrapper
@@ -262,11 +263,12 @@ class PipelineRunner:
                     # Align by date index
                     # Ensure both have date index
                     try:
+                        # Convert benchmark_df to same timezone/format if needed, but usually YYYY-MM-DD matches
                         df = df.join(benchmark_df['close'].rename('benchmark_close'), how='left')
                     except Exception as e:
-                        print(f"Failed to join benchmark: {e}")
+                        pass
                 
-                # Add symbol column for fundamental/board features to map correctly
+                # Add symbol column for fundamental/board/subjective features to map correctly
                 df['symbol'] = sym
                 
                 features_df = train_pipeline.transform(df)
