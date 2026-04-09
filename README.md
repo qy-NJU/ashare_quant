@@ -14,7 +14,13 @@ A-Share Quant 是一个基于 Python 的工业级、配置驱动 (Config-driven)
 - **⚙️ YAML 配置驱动**: 告别硬编码！通过修改 `configs/pipeline_config.yaml` 即可切换数据源、调整时间窗口、开启/关闭因子、修改模型参数，实现极简的策略实验。
 - **🔌 模块化架构**:
   - **离线数据湖 (Local Data Lake)**: 彻底剥离即时网络下载请求，采用独立的 `sync_data.py` 脚本进行数据每日增量/全量同步。底层采用 Parquet 格式进行按股票全历史存储，回测时在内存中极速切片，加载速度提升万倍，不再受限于网络波动。
-  - **特征工程 (Features)**: 支持 130+ 种 `pandas-ta` 技术指标、财务基本面因子（ROE、净利润增长等）、资金流向因子及大盘宏观特征。彻底消除了 LabelGenerator 中的未来函数，采用 T+1 开盘价作为真实交易成本基准。
+  - **特征工程 (Features)**: 
+    - **丰富的因子库**: 支持 130+ 种 `pandas-ta` 技术指标、财务基本面因子（ROE、净利润增长等）、资金流向因子及大盘宏观特征。
+    - **截面去噪与标准化**: 内置 `CrossSectionalProcessor`，在输入模型前强制进行按日期的横截面 MAD 去极值（Clipping）和 Z-Score 标准化，消除大盘 Beta 波动与极端异动的噪音。
+    - **消除未来函数**: `LabelGenerator` 采用 T+1 开盘价作为真实交易成本基准计算收益。
+  - **动态防雷与垃圾股过滤**:
+    - **静态过滤**: `StockPoolManager` 默认剔除 ST、*ST 及退市整理期股票，建立基础隔离墙。
+    - **动态过滤**: `DynamicFilter` 基于时序数据，动态剔除流动性枯竭的“僵尸股”（如近20日日均成交额<1000万）以及上市不满半年的次新股，防止模型被资金操纵和流动性陷阱反噬。
   - **模型层 (Models)**: 原生集成 XGBoost，支持**增量学习 (Incremental Learning)**、**类别特征原生处理 (Categorical Support)** 以及专业的**排序学习 (Learning to Rank - pairwise)**。
   - **策略与回测 (Strategy & Backtest)**: 
     - **严谨的 T+1 交易引擎**: 信号在 T 日收盘后生成，并在 T+1 日开盘价执行。
