@@ -12,6 +12,22 @@ class BacktestEngine:
         self.positions = {} # Symbol -> Quantity
         self.portfolio_history = []
         
+    def _get_limit_thresholds(self, symbol):
+        """
+        Return the limit up and limit down ratio based on the stock board.
+        STAR Market (sh.688) and ChiNext (sz.300) have 20% limits.
+        Others (Main board) have 10% limits.
+        (Ignoring ST stocks 5% for now as they are filtered out in pool_manager)
+        """
+        sym_str = str(symbol).lower()
+        if sym_str.startswith('sh.688') or sym_str.startswith('sz.300'):
+            return 1.20, 0.80
+        elif sym_str.startswith('bj.'):
+            # Beijing Stock Exchange has 30% limit
+            return 1.30, 0.70
+        else:
+            return 1.10, 0.90
+
     def run(self, start_date, end_date):
         """
         Run the backtest with T+1 execution logic, slippage, stamp duty, and limit up/down checks.
@@ -72,7 +88,9 @@ class BacktestEngine:
                         pre_close = pre_closes.get(symbol)
                         if price and pre_close:
                             # Check Limit Down (cannot sell)
-                            if price <= pre_close * 0.905:
+                            limit_up_ratio, limit_down_ratio = self._get_limit_thresholds(symbol)
+                            # Adding 0.005 buffer to catch precise tick limits
+                            if price <= pre_close * (limit_down_ratio + 0.005):
                                 print(f"[{date_str}] Limit Down! Cannot sell {symbol} @ {price:.2f}")
                                 continue
                                 
@@ -93,7 +111,8 @@ class BacktestEngine:
                             current_val = self.positions[symbol] * price
                             if current_val > target_val:
                                 # Check Limit Down
-                                if price <= pre_close * 0.905:
+                                limit_up_ratio, limit_down_ratio = self._get_limit_thresholds(symbol)
+                                if price <= pre_close * (limit_down_ratio + 0.005):
                                     print(f"[{date_str}] Limit Down! Cannot sell {symbol}")
                                     continue
                                     
@@ -120,7 +139,8 @@ class BacktestEngine:
                         
                         if current_val < target_val:
                             # Check Limit Up (cannot buy)
-                            if price >= pre_close * 1.095:
+                            limit_up_ratio, limit_down_ratio = self._get_limit_thresholds(symbol)
+                            if price >= pre_close * (limit_up_ratio - 0.005):
                                 print(f"[{date_str}] Limit Up! Cannot buy {symbol} @ {price:.2f}")
                                 continue
                                 
