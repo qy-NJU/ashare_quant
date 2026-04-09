@@ -16,6 +16,8 @@ A-Share Quant 是一个基于 Python 的工业级、配置驱动 (Config-driven)
   - **离线数据湖 (Local Data Lake)**: 彻底剥离即时网络下载请求，采用独立的 `sync_data.py` 脚本进行数据每日增量/全量同步。底层采用 Parquet 格式进行按股票全历史存储，回测时在内存中极速切片，加载速度提升万倍，不再受限于网络波动。
   - **特征工程 (Features)**: 
     - **丰富的因子库**: 支持 130+ 种 `pandas-ta` 技术指标、财务基本面因子（ROE、净利润增长等）、资金流向因子及大盘宏观特征。
+    - **🌟 主观逻辑量化**: 独家内置 `SubjectiveFactor`，将短线游资打法（打板溢价、换手突破、量价背离、弱转强等）翻译为精确的量价因子。
+    - **🌟 事件驱动整合**: 内置 `EventFactor`，将离散的市场事件（如龙虎榜机构与知名游资的净买入额）自动对齐到日K线中，赋予模型洞察“资金共识”的能力。
     - **截面去噪与标准化**: 内置 `CrossSectionalProcessor`，在输入模型前强制进行按日期的横截面 MAD 去极值（Clipping）和 Z-Score 标准化，消除大盘 Beta 波动与极端异动的噪音。
     - **消除未来函数**: `LabelGenerator` 采用 T+1 开盘价作为真实交易成本基准计算收益。
   - **动态防雷与垃圾股过滤**:
@@ -40,7 +42,8 @@ ashare_quant/
 ├── data/                       # 数据接入与管理层
 │   ├── local_lake/             # 🚀 本地离线数据湖 (Parquet)
 │   │   ├── basics/             # 股票基础信息
-│   │   └── daily_k/            # 个股日线全量历史数据
+│   │   ├── daily_k/            # 个股日线全量历史数据
+│   │   └── events/             # 离线事件数据池 (如龙虎榜数据)
 │   ├── source/                 # 具体数据源实现 (Baostock, AkShare)
 │   ├── repository.py           # 统一的数据仓库入口 (从 local_lake 极速加载)
 │   ├── pool_manager.py         # 股票池过滤器 (板块、交易所过滤)
