@@ -7,7 +7,7 @@ class MLStrategy(BaseStrategy):
     Strategy based on machine learning predictions.
     """
     def __init__(self, name, model, feature_pipeline, top_k=5, rebalance_period=20, universe=None, 
-                 use_market_filter=False, max_turnover=1.0, weight_method='equal'):
+                 use_market_filter=False, max_turnover=1.0, weight_method='equal', processor=None, dynamic_filter=None):
         """
         Args:
             name (str): Strategy name.
@@ -19,6 +19,8 @@ class MLStrategy(BaseStrategy):
             use_market_filter (bool): If True, stop buying when market is in downtrend.
             max_turnover (float): Maximum allowed portfolio turnover per rebalance (0.0 to 1.0).
             weight_method (str): 'equal' or 'score' (weight by model prediction score).
+            processor (CrossSectionalProcessor): Processor for cross-sectional MAD and Z-Score.
+            dynamic_filter (DynamicFilter): Filter for zombie/newly listed stocks.
         """
         super().__init__(name)
         self.model = model
@@ -26,6 +28,8 @@ class MLStrategy(BaseStrategy):
         self.top_k = top_k
         self.rebalance_period = rebalance_period
         self.universe = universe
+        self.processor = processor
+        self.dynamic_filter = dynamic_filter
         
         # Advanced configurations
         self.use_market_filter = use_market_filter
@@ -94,16 +98,35 @@ class MLStrategy(BaseStrategy):
         if not self.universe and len(candidates) > 20:
             candidates = candidates[:20] 
         
-        predictions = []
+        # Collect latest features for all candidates to form a cross-section
+        latest_features_list = []
+        valid_symbols = []
+        
+        # We need benchmark close for some factors
+        benchmark_df = data_loader.get_daily_data("sh.000300", 
+                                                start_date=(pd.to_datetime(date) - pd.Timedelta(days=100)).strftime('%Y%m%d'), 
+                                                end_date=date)
         
         for symbol in candidates:
             start_dt = pd.to_datetime(date) - pd.Timedelta(days=100)
             df = data_loader.get_daily_data(symbol, start_date=start_dt.strftime('%Y%m%d'), end_date=date)
             
-            if len(df) < 30: # Minimum required
+            if df.empty or len(df) < 30: # Minimum required
                 continue
+                
+            # Apply Dynamic Filter (Zombie stocks, New stocks)
+            if self.dynamic_filter:
+                df = self.dynamic_filter.filter(df)
+                if df.empty: continue
             
-            # Inject symbol for BoardFactor
+            # Merge benchmark
+            if not benchmark_df.empty:
+                try:
+                    df = df.join(benchmark_df['close'].rename('benchmark_close'), how='left')
+                except:
+                    pass
+            
+            # Inject symbol for BoardFactor and EventFactor
             df['symbol'] = symbol
                 
             try:
@@ -111,13 +134,35 @@ class MLStrategy(BaseStrategy):
                 if features_df.empty:
                     continue
                 
-                latest_features = features_df.iloc[[-1]] # Keep as DataFrame
-                
-                # Predict
-                score = self.model.predict(latest_features)[0]
-                predictions.append((symbol, score))
+                # Take the LATEST row to form the cross-section
+                latest_features = features_df.iloc[[-1]] 
+                latest_features_list.append(latest_features)
+                valid_symbols.append(symbol)
             except Exception as e:
                 continue
+                
+        if not latest_features_list:
+            return []
+            
+        # Form Cross-Section
+        X_full = pd.concat(latest_features_list)
+        
+        # Apply Cross-Sectional Processor (MAD Clip & Z-Score)
+        if self.processor:
+            feature_cols = X_full.drop(columns=['open', 'high', 'low', 'close', 'volume', 'date', 'symbol'], errors='ignore').columns.tolist()
+            X_full = self.processor.process(X_full, feature_cols)
+            
+        # Drop non-feature columns before prediction
+        X_pred = X_full.drop(columns=['open', 'high', 'low', 'close', 'volume', 'date', 'symbol'], errors='ignore')
+        
+        # Batch Predict
+        try:
+            scores = self.model.predict(X_pred)
+        except Exception as e:
+            print(f"[{date}] Prediction failed: {e}")
+            return []
+            
+        predictions = [(sym, score) for sym, score in zip(valid_symbols, scores)]
                 
         # Sort by score descending
         predictions.sort(key=lambda x: x[1], reverse=True)

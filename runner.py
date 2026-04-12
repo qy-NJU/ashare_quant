@@ -346,7 +346,8 @@ class PipelineRunner:
         strat_params = strat_cfg.get('params', {})
         
         if strat_cfg['name'] == 'MLStrategy':
-            strategy = MLStrategy(name="YAML_Strategy", model=model, feature_pipeline=infer_pipeline, universe=symbols, **strat_params)
+            strategy = MLStrategy(name="YAML_Strategy", model=model, feature_pipeline=infer_pipeline, universe=symbols, 
+                                  processor=processor, dynamic_filter=dynamic_filter, **strat_params)
         else:
             strategy = self._instantiate_class(strat_cfg['name'], strat_params)
 
