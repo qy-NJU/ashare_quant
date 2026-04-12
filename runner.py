@@ -17,6 +17,7 @@ from features.factors.financial import FinancialFactor
 from features.factors.fund_flow import FundFlowFactor
 from features.factors.market import MarketFactor
 from features.factors.subjective import SubjectiveFactor
+from features.factors.pattern import PatternFactor
 from features.factors.technical import LabelGenerator
 from features.processor import CrossSectionalProcessor, DynamicFilter
 from models.xgboost_model import XGBoostWrapper

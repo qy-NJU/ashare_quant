@@ -17,6 +17,7 @@ A-Share Quant 是一个基于 Python 的工业级、配置驱动 (Config-driven)
   - **特征工程 (Features)**: 
     - **丰富的因子库**: 支持 130+ 种 `pandas-ta` 技术指标、财务基本面因子（ROE、净利润增长等）、资金流向因子及大盘宏观特征。
     - **🌟 主观逻辑量化**: 独家内置 `SubjectiveFactor`，将短线游资打法（打板溢价、换手突破、量价背离、弱转强等）翻译为精确的量价因子。
+    - **🌟 经典形态识别**: 内置 `PatternFactor`，通过向量化代码精准识别A股高胜率形态，如**均线多头排列**、**箱体平台突破**、**龙头首阴反包**、**MACD底背离**以及**红三兵**。
     - **🌟 事件驱动整合**: 内置 `EventFactor`，将离散的市场事件（如龙虎榜机构与知名游资的净买入额）自动对齐到日K线中，赋予模型洞察“资金共识”的能力。
     - **截面去噪与标准化**: 内置 `CrossSectionalProcessor`，在输入模型前强制进行按日期的横截面 MAD 去极值（Clipping）和 Z-Score 标准化，消除大盘 Beta 波动与极端异动的噪音。
     - **消除未来函数**: `LabelGenerator` 采用 T+1 开盘价作为真实交易成本基准计算收益。
@@ -55,6 +56,8 @@ ashare_quant/
 │   │   ├── financial.py        # 财务基本面因子
 │   │   ├── fund_flow.py        # 资金流向因子
 │   │   ├── market.py           # 大盘宏观因子
+│   │   ├── subjective.py       # 🌟 主观交易逻辑因子 (涨停溢价/弱转强/量价背离)
+│   │   ├── event_driven.py     # 🌟 事件驱动因子 (龙虎榜资金等)
 │   │   └── technical.py        # Label生成器 (回归、二分类、排序等)
 │   └── pipeline.py             # 特征处理流水线
 ├── models/                     # 机器学习模型层
@@ -89,8 +92,11 @@ pip install pandas numpy xgboost scikit-learn baostock akshare pandas-ta pyyaml 
 ### 2. 同步本地数据湖
 由于废弃了边跑边下的旧模式，运行回测前必须通过 `sync_data.py` 将最新数据拉取到本地数据湖中。
 ```bash
-# 全量同步所有 A 股日线数据 (耗时较长，建议盘后执行)
+# 全量同步所有 A 股日线数据及龙虎榜事件 (耗时较长，建议盘后执行)
 python scripts/sync_data.py
+
+# 只单独更新最新的事件数据（如龙虎榜）
+python scripts/sync_data.py --events_only
 
 # 或者为了快速测试，只同步前 50 只股票
 python scripts/sync_data.py --limit 50
@@ -134,6 +140,17 @@ data:
     board: "chinext"    # 可选: 'main'(主板), 'chinext'(创业板), 'star'(科创板), 'all'
     exchange: "sz"      # 可选: 'sh', 'sz', 'bj', 'all'
     max_count: 50       # 测试用，限制股票数量。实盘设为 0
+```
+
+### 数据预处理与防雷 (`preprocessing`)
+```yaml
+preprocessing:
+  dynamic_filter:
+    enable: true
+    min_avg_turnover: 10000000  # 剔除近20日日均成交额低于 1000万 的僵尸股
+    min_listed_days: 120        # 剔除上市不满半年的次新股
+  mad_clip: true                # 开启横截面 MAD 去极值
+  z_score: true                 # 开启横截面 Z-Score 标准化
 ```
 
 ### 建模目标 (`LabelGenerator`)

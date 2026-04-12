@@ -1,5 +1,26 @@
 import pandas as pd
 from .factors.base_factor import BaseFactor
+from .factors.pandas_ta_factor import PandasTAFactor
+from .factors.fundamental import BoardFactor
+from .factors.financial import FinancialFactor
+from .factors.fund_flow import FundFlowFactor
+from .factors.market import MarketFactor
+from .factors.subjective import SubjectiveFactor
+from .factors.event_driven import EventFactor
+from .factors.pattern import PatternFactor
+from .factors.technical import LabelGenerator
+
+FACTOR_MAP = {
+    "PandasTAFactor": PandasTAFactor,
+    "BoardFactor": BoardFactor,
+    "FinancialFactor": FinancialFactor,
+    "FundFlowFactor": FundFlowFactor,
+    "MarketFactor": MarketFactor,
+    "SubjectiveFactor": SubjectiveFactor,
+    "EventFactor": EventFactor,
+    "PatternFactor": PatternFactor,
+    "LabelGenerator": LabelGenerator
+}
 
 class FeaturePipeline:
     """
