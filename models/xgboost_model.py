@@ -3,6 +3,65 @@ import xgboost as xgb
 import pandas as pd
 import numpy as np
 import os
+from scipy.stats import spearmanr
+
+
+def calculate_ic(predictions, actual_returns):
+    """
+    Calculate Information Coefficient (IC) - Pearson correlation between predictions and returns.
+
+    Args:
+        predictions: array-like, model predictions
+        actual_returns: array-like, actual future returns
+
+    Returns:
+        float: IC value (range -1 to 1)
+    """
+    # Remove NaN pairs
+    mask = ~(np.isnan(predictions) | np.isnan(actual_returns))
+    if mask.sum() < 3:
+        return np.nan
+    return np.corrcoef(predictions[mask], actual_returns[mask])[0, 1]
+
+
+def calculate_rank_ic(predictions, actual_returns):
+    """
+    Calculate Rank Information Coefficient (Rank IC) - Spearman correlation.
+
+    More robust than IC as it uses rankings, less sensitive to outliers.
+
+    Args:
+        predictions: array-like, model predictions
+        actual_returns: array-like, actual future returns
+
+    Returns:
+        float: Rank IC value (range -1 to 1)
+    """
+    mask = ~(np.isnan(predictions) | np.isnan(actual_returns))
+    if mask.sum() < 3:
+        return np.nan
+    return spearmanr(predictions[mask], actual_returns[mask]).correlation
+
+
+def calculate_icir(ic_series):
+    """
+    Calculate IC Information Ratio (ICIR).
+
+    IR = mean(IC) / std(IC)
+    Measures the consistency of IC performance over time.
+
+    Args:
+        ic_series: array-like, IC values over multiple periods
+
+    Returns:
+        float: IR value (higher is better, >1.0 is good, >2.0 is excellent)
+    """
+    ic_array = np.array(ic_series)
+    ic_array = ic_array[~np.isnan(ic_array)]
+    if len(ic_array) == 0:
+        return np.nan
+    return ic_array.mean() / ic_array.std()
+
 
 class XGBoostWrapper(BaseModel):
     """
@@ -55,9 +114,9 @@ class XGBoostWrapper(BaseModel):
             return 'rmse'   # Regression uses RMSE
 
     def train(self, X, y, num_boost_round=50, groups=None, eval_X=None, eval_y=None,
-              early_stopping_rounds=10):
+              early_stopping_rounds=10, eval_ic=False):
         """
-        Train XGBoost model with optional early stopping.
+        Train XGBoost model with optional early stopping and IC evaluation.
 
         Args:
             X: Training features
@@ -67,9 +126,10 @@ class XGBoostWrapper(BaseModel):
             eval_X: Optional validation features for early stopping
             eval_y: Optional validation labels for early stopping
             early_stopping_rounds: Stop if no improvement after N rounds (default: 10, disabled if eval_X is None)
+            eval_ic: If True, calculate IC/Rank IC after training (default: False)
 
         Returns:
-            dict: Training history with evaluation metrics
+            dict: Training result with metrics
         """
         X_clean = self._prepare_data(X)
         dtrain = xgb.DMatrix(X_clean, label=y, enable_categorical=True)
@@ -138,11 +198,22 @@ class XGBoostWrapper(BaseModel):
             else:
                 print()
 
+        # Calculate IC metrics if requested (useful for regression/ranking objectives)
+        ic_result = None
+        if eval_ic and self.params.get('objective') in ['reg:squarederror', 'rank:pairwise']:
+            train_preds = self.booster.predict(dtrain)
+            ic_result = {
+                'ic': calculate_ic(train_preds, y),
+                'rank_ic': calculate_rank_ic(train_preds, y)
+            }
+            print(f"[{self.name}] IC Metrics: IC={ic_result['ic']:.4f}, Rank IC={ic_result['rank_ic']:.4f}")
+
         # Store training info
         self.train_history.append({
             'type': 'full',
             'rounds': num_boost_round,
-            'metric': eval_metric
+            'metric': eval_metric,
+            'ic_result': ic_result
         })
 
         return self.booster
@@ -216,6 +287,70 @@ class XGBoostWrapper(BaseModel):
 
         scores = self.booster.get_score(importance_type=importance_type)
         return scores
+
+    def evaluate_ic(self, X, y_true):
+        """
+        Evaluate model using Information Coefficient metrics.
+
+        Calculates IC (Pearson) and Rank IC (Spearman) between predictions and actual returns.
+
+        Args:
+            X: Features for prediction
+            y_true: Actual returns/labels (same length as predictions)
+
+        Returns:
+            dict: {'ic': float, 'rank_ic': float, 'ir': float or None}
+        """
+        predictions = self.predict(X)
+
+        ic = calculate_ic(predictions, y_true)
+        rank_ic = calculate_rank_ic(predictions, y_true)
+
+        result = {
+            'ic': ic,
+            'rank_ic': rank_ic,
+            'ir': None  # IR requires multiple periods, use evaluate_ic_series instead
+        }
+
+        return result
+
+    def evaluate_ic_series(self, ic_data_list):
+        """
+        Calculate IR (IC Information Ratio) from a series of IC values.
+
+        Args:
+            ic_data_list: List of tuples (predictions, actual_returns) for multiple periods,
+                          or list of IC values directly
+
+        Returns:
+            dict: {'ic_mean': float, 'ic_std': float, 'ir': float, 'ic_series': list}
+        """
+        # If input is list of (pred, actual) pairs, calculate IC for each
+        if len(ic_data_list) > 0 and isinstance(ic_data_list[0], (list, tuple, np.ndarray)):
+            ic_series = []
+            for preds, actuals in ic_data_list:
+                ic_val = calculate_rank_ic(np.array(preds), np.array(actuals))
+                ic_series.append(ic_val)
+        else:
+            # Assume it's already a list of IC values
+            ic_series = list(ic_data_list)
+
+        ic_array = np.array(ic_series)
+        ic_array = ic_array[~np.isnan(ic_array)]
+
+        if len(ic_array) == 0:
+            return {'ic_mean': np.nan, 'ic_std': np.nan, 'ir': np.nan, 'ic_series': ic_series}
+
+        ic_mean = ic_array.mean()
+        ic_std = ic_array.std()
+        ir = ic_mean / ic_std if ic_std > 0 else np.nan
+
+        return {
+            'ic_mean': ic_mean,
+            'ic_std': ic_std,
+            'ir': ir,
+            'ic_series': ic_series
+        }
 
     def save(self, path):
         """Save model to file."""
