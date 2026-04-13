@@ -17,6 +17,12 @@ pipeline:
       exclude_st: true    # 是否剔除 ST/*ST/退市股，过滤垃圾股防雷
       max_count: 10       # 为了跑得快点，这里限制前 10 只（如果要全市场，设为0，但这会下载很久）
 
+  # 训练加速与数据降噪优化
+  training_optimization:
+    sample_rate: 0.5            # 随机降采样：仅使用 50% 的数据进行训练 (加快速度并防止过拟合，1.0为不采样)
+    drop_middle: true           # 截面极值采样：丢弃表现平庸的样本，迫使模型学习强势股和弱势股的本质区别
+    drop_middle_threshold: 0.4  # 丢弃收益率排在中间 40% (即 30% ~ 70%) 的样本
+
   # 特征预处理配置 (去极值与标准化，减少市场噪音干扰)
   preprocessing:
     dynamic_filter:       # 动态过滤僵尸股与次新股

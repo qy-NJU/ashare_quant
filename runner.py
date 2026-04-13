@@ -1,7 +1,8 @@
 import yaml
 import os
 import pandas as pd
-import importlib
+import hashlib
+import json
 
 # Import all possible components to make them available for eval/getattr
 from data.repository import DataRepository
@@ -66,6 +67,21 @@ class PipelineRunner:
                 factors.append(self._instantiate_class(name, params))
             
         return FeaturePipeline(factors)
+
+    def _get_feature_cache_path(self, symbol, start, end, include_label):
+        """
+        Generate a unique cache path for the features based on the pipeline config.
+        This prevents re-calculating 100+ indicators if the config hasn't changed.
+        """
+        # Create a deterministic string representation of the features config
+        config_str = json.dumps(self.config['features'], sort_keys=True)
+        config_hash = hashlib.md5(config_str.encode('utf-8')).hexdigest()[:8]
+        
+        cache_dir = os.path.join(self.config['data'].get('cache_dir', 'data/local_lake'), 'features', config_hash)
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        label_str = "with_label" if include_label else "no_label"
+        return os.path.join(cache_dir, f"{symbol}_{start}_{end}_{label_str}.parquet")
 
     def build_model(self):
         print("Building Model...")
@@ -251,36 +267,67 @@ class PipelineRunner:
             # Let's fetch benchmark data once per window (sh.000300 is HS300 in Baostock)
             benchmark_df = repo.get_daily_data("sh.000300", start, end)
             
+            opt_cfg = self.config.get('training_optimization', {})
+            sample_rate = opt_cfg.get('sample_rate', 1.0)
+            drop_middle = opt_cfg.get('drop_middle', False)
+            drop_middle_threshold = opt_cfg.get('drop_middle_threshold', 0.3)
+            
             for sym in symbols:
-                df = repo.get_daily_data(sym, start, end)
-                if df.empty: continue
+                # 1. Try to load from Feature Cache
+                cache_path = self._get_feature_cache_path(sym, start, end, include_label=True)
                 
-                # Apply Dynamic Filter (Zombie stocks, New stocks)
-                if enable_filter:
-                    df = dynamic_filter.filter(df)
-                    if df.empty: continue
-                
-                # Merge benchmark close if needed for excess return
-                if not benchmark_df.empty:
-                    # Align by date index
-                    # Ensure both have date index
+                if os.path.exists(cache_path):
                     try:
-                        # Convert benchmark_df to same timezone/format if needed, but usually YYYY-MM-DD matches
-                        df = df.join(benchmark_df['close'].rename('benchmark_close'), how='left')
+                        features_df = pd.read_parquet(cache_path)
+                        # We still need to apply dynamic filter on loaded features if required
+                        # But wait, dynamic filter needs volume/amount/close. 
+                        # We should have them in features_df if we didn't drop them yet.
+                    except Exception as e:
+                        features_df = pd.DataFrame()
+                else:
+                    features_df = pd.DataFrame()
+                    
+                if features_df.empty:
+                    df = repo.get_daily_data(sym, start, end)
+                    if df.empty: continue
+                    
+                    # Apply Dynamic Filter (Zombie stocks, New stocks)
+                    if enable_filter:
+                        df = dynamic_filter.filter(df)
+                        if df.empty: continue
+                    
+                    # Merge benchmark close if needed for excess return
+                    if not benchmark_df.empty:
+                        # Align by date index
+                        try:
+                            df = df.join(benchmark_df['close'].rename('benchmark_close'), how='left')
+                        except Exception as e:
+                            pass
+                    
+                    # Add symbol column for fundamental/board/subjective features to map correctly
+                    df['symbol'] = sym
+                    
+                    features_df = train_pipeline.transform(df)
+                    if features_df.empty: continue
+                    
+                    # Save to Feature Cache
+                    try:
+                        features_df.to_parquet(cache_path, engine='pyarrow')
                     except Exception as e:
                         pass
-                
-                # Add symbol column for fundamental/board/subjective features to map correctly
-                df['symbol'] = sym
-                
-                features_df = train_pipeline.transform(df)
-                if features_df.empty: continue
                 
                 target_col = [c for c in features_df.columns if c.startswith('target_')]
                 if not target_col: continue
                 target_col = target_col[0]
                 
                 features_df = features_df.dropna(subset=[target_col])
+                
+                # Apply Data Sampling (Random Downsampling)
+                if sample_rate < 1.0:
+                    features_df = features_df.sample(frac=sample_rate, random_state=42)
+                    
+                if features_df.empty: continue
+                
                 X = features_df.drop(columns=[target_col, 'open', 'high', 'low', 'close', 'volume', 'date', 'symbol'], errors='ignore')
                 y = features_df[target_col]
                 
@@ -302,8 +349,22 @@ class PipelineRunner:
                 label_gen_cfg = next((f for f in self.config['features'] if f['name'] == 'LabelGenerator'), None)
                 if label_gen_cfg and label_gen_cfg.get('params', {}).get('target_type') == 'rank_pct':
                     print("Applying cross-sectional percentage ranking to labels...")
-                    # Group by date index and calculate percentage rank
                     y_full = y_full.groupby(level=0).rank(pct=True)
+                    
+                # Apply Data Sampling (Drop Middle)
+                if drop_middle:
+                    print(f"Applying Drop Middle sampling (threshold: {drop_middle_threshold})...")
+                    # We drop samples where the target value is around the median (e.g. between 0.35 and 0.65)
+                    # For rank_pct, the median is 0.5. 
+                    lower_bound = 0.5 - drop_middle_threshold / 2
+                    upper_bound = 0.5 + drop_middle_threshold / 2
+                    
+                    # Create mask to keep extremes
+                    keep_mask = (y_full <= lower_bound) | (y_full >= upper_bound)
+                    
+                    X_full = X_full[keep_mask]
+                    y_full = y_full[keep_mask]
+                    print(f"Kept {len(y_full)} extreme samples after dropping middle.")
                 
                 # If using ranking objective, we need groups (query structure)
                 groups = None
