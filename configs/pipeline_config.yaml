@@ -15,7 +15,7 @@ pipeline:
       board: "all"        # 跑全市场 A 股
       exchange: "all"     
       exclude_st: true    # 是否剔除 ST/*ST/退市股，过滤垃圾股防雷
-      max_count: 10       # 为了跑得快点，这里限制前 10 只（如果要全市场，设为0，但这会下载很久）
+      max_count: 0       # 为了跑得快点，这里限制前 10 只（如果要全市场，设为0，但这会下载很久）
 
   # 训练加速与数据降噪优化
   training_optimization:
@@ -36,12 +36,12 @@ pipeline:
   windows:
     # 训练时间段: 2025年12月到2026年2月
     train:
-      - start: "2023-01-01"
-        end: "2023-06-30"
+      - start: "2024-01-01"
+        end: "2025-12-31"
     # 回测/评测时间段: 2026年3月
     backtest:
-      start: "2023-07-01"
-      end: "2023-07-31"
+      start: "2026-01-01"
+      end: "2026-04-10"
 
   # 特征工程配置
   features:
