@@ -9,81 +9,102 @@ A-Share Quant 是一个基于 Python 的工业级、配置驱动 (Config-driven)
 
 ---
 
-## 🌟 核心特性 (Features)
+##  核心特性 (Features)
 
-- **⚙️ YAML 配置驱动**: 告别硬编码！通过修改 `configs/pipeline_config.yaml` 即可切换数据源、调整时间窗口、开启/关闭因子、修改模型参数，实现极简的策略实验。
-- **🔌 模块化架构**:
-  - **离线数据湖 (Local Data Lake)**: 彻底剥离即时网络下载请求，采用独立的 `sync_data.py` 脚本进行数据每日增量/全量同步。底层采用 Parquet 格式进行按股票全历史存储，回测时在内存中极速切片，加载速度提升万倍，不再受限于网络波动。
-  - **🚀 极速特征缓存 (Feature Caching)**: 内置基于配置 MD5 指纹的特征缓存机制。相同配置下，第二次运行将跳过 130+ 种技术指标与自定义因子的重复计算，直接从本地读取，训练提速 100 倍以上。
-  - **📉 训练降噪采样 (Data Sampling)**: 支持在训练阶段进行**随机降采样 (Random Downsampling)**以防止过拟合，以及**截面极值采样 (Drop Middle)**直接丢弃中间 40% 表现平庸的样本，迫使模型聚焦于寻找“牛股”与“熊股”的本质区别。
-  - **特征工程 (Features)**: 
-    - **丰富的因子库**: 支持 130+ 种 `pandas-ta` 技术指标、财务基本面因子（ROE、净利润增长等）、资金流向因子及大盘宏观特征。
-    - **🌟 主观逻辑量化**: 独家内置 `SubjectiveFactor`，将短线游资打法（打板溢价、换手突破、量价背离、弱转强等）翻译为精确的量价因子。
-    - **🌟 经典形态识别**: 内置 `PatternFactor`，通过向量化代码精准识别A股高胜率形态，如**均线多头排列**、**箱体平台突破**、**龙头首阴反包**、**MACD底背离**以及**红三兵**。
-    - **🌟 事件驱动整合**: 内置 `EventFactor`，将离散的市场事件（如龙虎榜机构与知名游资的净买入额）自动对齐到日K线中，赋予模型洞察“资金共识”的能力。
-    - **截面去噪与标准化**: 内置 `CrossSectionalProcessor`，在输入模型前强制进行按日期的横截面 MAD 去极值（Clipping）和 Z-Score 标准化，消除大盘 Beta 波动与极端异动的噪音。
-    - **消除未来函数**: `LabelGenerator` 采用 T+1 开盘价作为真实交易成本基准计算收益。
-  - **动态防雷与垃圾股过滤**:
-    - **静态过滤**: `StockPoolManager` 默认剔除 ST、*ST 及退市整理期股票，建立基础隔离墙。
-    - **动态过滤**: `DynamicFilter` 基于时序数据，动态剔除流动性枯竭的“僵尸股”（如近20日日均成交额<1000万）以及上市不满半年的次新股，防止模型被资金操纵和流动性陷阱反噬。
-  - **模型层 (Models)**: 原生集成 XGBoost，支持**增量学习 (Incremental Learning)**、**类别特征原生处理 (Categorical Support)** 以及专业的**排序学习 (Learning to Rank - pairwise)**。
-  - **策略与回测 (Strategy & Backtest)**: 
-    - **严谨的 T+1 交易引擎**: 信号在 T 日收盘后生成，并在 T+1 日开盘价执行。
-    - **A 股特色机制**: 完美支持涨跌停（Limit Up/Down）过滤（涨停不买、跌停不卖），内置滑点（Slippage）与 A股真实印花税（单边万分之五）计算，挤出回测水分。
-    - **进阶风控**: 支持大盘风控过滤（如跌破20日线空仓）、换手率控制及基于预测分数的资金加权分配。
-- **🔮 实盘预测模式**: 提供专门的 `configs/predict_config.yaml` 和推理模式，一键输出“明日十大金股”。
+### 配置驱动
+- **YAML 配置驱动**: 通过修改 `configs/pipeline_config.yaml` 即可切换数据源、调整时间窗口、开启/关闭因子、修改模型参数，实现极简的策略实验。
+
+### 数据管理
+- **离线数据湖 (Local Data Lake)**: 彻底剥离即时网络下载，采用独立的 `sync_data.py` 脚本进行数据每日增量/全量同步。底层采用 Parquet 格式进行按股票全历史存储，回测时在内存中极速切片。
+- **极速特征缓存 (Feature Caching)**: 内置基于配置 MD5 指纹的特征缓存机制。相同配置下，第二次运行将跳过 130+ 种技术指标与自定义因子的重复计算，直接从本地读取。
+
+### 特征工程
+- **丰富的因子库**: 支持 130+ 种 `pandas-ta` 技术指标、财务基本面因子（ROE、净利润增长等）、资金流向因子及大盘宏观特征。
+- **主观逻辑量化**: 独家内置 `SubjectiveFactor`，将短线游资打法（打板溢价、换手突破、量价背离、弱转强等）翻译为精确的量价因子。
+- **经典形态识别**: 内置 `PatternFactor`，通过向量化代码精准识别A股高胜率形态，如均线多头排列、箱体平台突破、龙头首阴反包、MACD底背离以及红三兵。
+- **事件驱动整合**: 内置 `EventFactor`，将离散的市场事件（如龙虎榜机构与知名游资的净买入额）自动对齐到日K线中。
+- **截面去噪与标准化**: 内置 `CrossSectionalProcessor`，在输入模型前强制进行按日期的横截面 MAD 去极值（Clipping）和 Z-Score 标准化。
+- **消除未来函数**: `LabelGenerator` 采用 T+1 开盘价作为真实交易成本基准计算收益。
+
+### 训练优化
+- **数据采样**: 支持随机降采样 (Random Downsampling) 以防止过拟合，以及 Drop Middle (截面极值采样) 直接丢弃中间表现平庸的样本，迫使模型聚焦于寻找"牛股"与"熊股"的本质区别。
+- **增量学习**: 支持增量训练，无需全量重训练即可更新模型。
+- **Learning to Rank**: 支持 `rank:pairwise` 目标函数，配合截面收益率排名标签 (rank_pct) 效果最佳。
+
+### 策略与回测
+- **严谨的 T+1 交易引擎**: 信号在 T 日收盘后生成，并在 T+1 日开盘价执行。
+- **A 股特色机制**: 完美支持涨跌停（Limit Up/Down）过滤（涨停不买、跌停不卖），内置滑点（Slippage）与 A股真实印花税（单边万分之五）计算。
+- **大盘风控**: 支持大盘趋势过滤（如跌破20日线空仓）、换手率控制及基于预测分数的资金加权分配。
+
+### 防雷机制
+- **静态过滤**: `StockPoolManager` 默认剔除 ST、*ST 及退市整理期股票。
+- **动态过滤**: `DynamicFilter` 基于时序数据，动态剔除流动性枯竭的"僵尸股"（如近20日日均成交额<1000万）以及上市不满半年的次新股。
 
 ---
 
-## 🏗️ 架构概览 (Architecture)
+##  项目结构 (Project Structure)
 
 ```text
 ashare_quant/
-├── configs/                    # ⚙️ 配置文件目录
+├── configs/                    # 配置文件目录
 │   ├── pipeline_config.yaml    # 训练与回测配置文件
 │   └── predict_config.yaml     # 实盘推理配置文件
 ├── data/                       # 数据接入与管理层
-│   ├── local_lake/             # 🚀 本地离线数据湖 (Parquet)
+│   ├── __init__.py
+│   ├── repository.py           # 统一的数据仓库入口（从 local_lake 加载）
+│   ├── pool_manager.py         # 股票池过滤器（板块、交易所过滤）
+│   ├── market_manager.py       # 大盘指数与宏观数据管理
+│   ├── board_manager.py        # 板块/行业管理
+│   ├── local_lake/             # 本地离线数据湖 (Parquet)
 │   │   ├── basics/             # 股票基础信息
 │   │   ├── daily_k/            # 个股日线全量历史数据
-│   │   ├── events/             # 离线事件数据池 (如龙虎榜数据)
-│   │   └── features/           # ⚡️ 基于 MD5 配置指纹的特征缓存池
-│   ├── source/                 # 具体数据源实现 (Baostock, AkShare)
-│   ├── repository.py           # 统一的数据仓库入口 (从 local_lake 极速加载)
-│   ├── pool_manager.py         # 股票池过滤器 (板块、交易所过滤)
-│   └── market_manager.py       # 大盘指数与宏观数据管理
-├── features/                   # 特征工程层 (Pipeline)
-│   ├── factors/                # 因子库
-│   │   ├── pandas_ta_factor.py # 技术指标因子 (基于 pandas-ta)
-│   │   ├── fundamental.py      # 行业/概念类别因子
-│   │   ├── financial.py        # 财务基本面因子
-│   │   ├── fund_flow.py        # 资金流向因子
-│   │   ├── market.py           # 大盘宏观因子
-│   │   ├── subjective.py       # 🌟 主观交易逻辑因子 (涨停溢价/弱转强/量价背离)
-│   │   ├── pattern.py          # 🌟 经典形态识别因子 (均线多头/平台突破/反包/底背离)
-│   │   ├── event_driven.py     # 🌟 事件驱动因子 (龙虎榜资金等)
-│   │   └── technical.py        # Label生成器 (回归、二分类、排序等)
-│   └── pipeline.py             # 特征处理流水线
+│   │   ├── events/             # 事件数据池（如龙虎榜数据）
+│   │   └── features/           # 基于 MD5 配置指纹的特征缓存池
+│   └── source/                 # 数据源实现（已弃用，数据从 local_lake 加载）
+│       ├── baostock_source.py
+│       ├── akshare_source.py
+│       └── mock_source.py
+├── features/                    # 特征工程层
+│   ├── __init__.py
+│   ├── pipeline.py             # 特征处理流水线
+│   ├── processor.py            # 横截面处理器（MAD去极值、Z-Score标准化）
+│   └── factors/                # 因子库
+│       ├── __init__.py
+│       ├── base_factor.py      # 因子基类
+│       ├── pandas_ta_factor.py # 技术指标因子（基于 pandas-ta）
+│       ├── financial.py        # 财务基本面因子
+│       ├── fund_flow.py        # 资金流向因子
+│       ├── market.py           # 大盘宏观因子
+│       ├── fundamental.py      # 行业/概念类别因子
+│       ├── subjective.py       # 主观交易逻辑因子
+│       ├── pattern.py          # 经典形态识别因子
+│       ├── event_driven.py     # 事件驱动因子
+│       └── technical.py        # Label 生成器
 ├── models/                     # 机器学习模型层
+│   ├── base_model.py           # 模型基类
 │   ├── xgboost_model.py        # XGBoost 包装器
 │   └── machine_learning.py     # Sklearn 通用包装器
 ├── strategies/                 # 交易策略层
+│   ├── base_strategy.py        # 策略基类
 │   ├── ml_strategy.py          # 基于 ML 预测分数的选股策略
 │   └── momentum_strategy.py    # 传统动量策略示例
 ├── backtest/                   # 回测引擎层
 │   └── engine.py               # 事件驱动的回测与撮合逻辑
 ├── scripts/                    # 实用脚本目录
-│   └── sync_data.py            # 🚀 离线数据湖同步脚本
-├── runner.py                   # 🌟 核心引擎：配置解析与流水线执行器
-└── analyze_importance.py       # 因子重要性分析工具
+│   └── sync_data.py            # 离线数据湖同步脚本
+├── utils/                      # 工具函数
+├── runner.py                   # 核心引擎：配置解析与流水线执行器
+├── main.py                     # 简单 CLI（动量策略回测）
+├── analyze_importance.py       # 因子重要性分析工具
+└── requirements.txt            # 依赖列表
 ```
 
 ---
 
-## 🚀 快速开始 (Quick Start)
+##  快速开始 (Quick Start)
 
 ### 1. 环境准备
-建议使用 Python 3.8 及以上版本。
+
 ```bash
 # 克隆代码
 git clone <repository_url>
@@ -94,73 +115,85 @@ pip install pandas numpy xgboost scikit-learn baostock akshare pandas-ta pyyaml 
 ```
 
 ### 2. 同步本地数据湖
-由于废弃了边跑边下的旧模式，运行回测前必须通过 `sync_data.py` 将最新数据拉取到本地数据湖中。
+
 ```bash
-# 全量同步所有 A 股日线数据及龙虎榜事件 (耗时较长，建议盘后执行)
+# 全量同步所有 A 股日线数据及龙虎榜事件（耗时较长，建议盘后执行）
 python scripts/sync_data.py
 
-# 指定开始日期同步数据 (增量或指定区间同步)
+# 指定开始日期同步数据（增量或指定区间同步）
 python scripts/sync_data.py --start_date 2023-01-01
 
-# 只单独更新最新的事件数据（如龙虎榜）
+# 只单独更新事件数据（如龙虎榜）
 python scripts/sync_data.py --events_only
 
-# 或者为了快速测试，只同步前 50 只股票
+# 为了快速测试，只同步前 50 只股票
 python scripts/sync_data.py --limit 50
 ```
 
 ### 3. 运行模型训练与回测
+
 编辑 `configs/pipeline_config.yaml`，设定您想要的数据范围、因子组合和模型参数，然后执行：
+
 ```bash
 python runner.py configs/pipeline_config.yaml
 ```
+
 系统将自动：
-1. 瞬间从本地 Data Lake 加载所需数据并进行内存切片
+1. 从本地 Data Lake 加载所需数据
 2. 生成全量特征矩阵
 3. 训练 XGBoost 模型并保存到 `models/saved/`
 4. 在样本外时间段执行模拟回测并输出收益报告
 
-### 4. 特征重要性分析 (因子提纯)
-在跑完一次“全量特征”训练后，您可以分析哪些因子真正有效：
+### 4. 特征重要性分析
+
+在跑完一次"全量特征"训练后，您可以分析哪些因子真正有效：
+
 ```bash
 python analyze_importance.py
 ```
-这会输出特征重要性排名（并保存在 `data/analysis/` 下）。您可以挑选 Top 30 的因子，将它们填入 YAML 的 `custom` 策略中进行第二轮精简训练，从而提高模型鲁棒性。
 
-### 5. 生成实盘预测 (Inference)
+### 5. 生成实盘预测
+
 当模型训练完毕后，使用推理配置文件进行最新数据的预测：
+
 ```bash
 python runner.py configs/predict_config.yaml
 ```
 
 ---
 
-## ⚙️ 配置指南 (Configuration Guide)
+##  配置指南 (Configuration Guide)
 
-`configs/pipeline_config.yaml` 是整个框架的“遥控器”。以下是关键配置项说明：
+### 数据与股票池
 
-### 数据与股票池 (`data`)
 ```yaml
 data:
-  sources: ["BaostockSource"]
+  sources: ["BaostockSource"]  # 已弃用，数据统一从 Local Data Lake 加载
+  cache_dir: "data/local_lake"
+
+  # 股票池配置（如果指定了 symbols，则优先使用 symbols，忽略 pool 配置）
+  symbols: []  # 为空则使用 pool 过滤
   pool:
-    board: "chinext"    # 可选: 'main'(主板), 'chinext'(创业板), 'star'(科创板), 'all'
-    exchange: "sz"      # 可选: 'sh', 'sz', 'bj', 'all'
-    max_count: 50       # 测试用，限制股票数量。实盘设为 0
+    board: "all"      # 可选: 'main'(主板), 'chinext'(创业板), 'star'(科创板), 'all'
+    exchange: "all"   # 可选: 'sh', 'sz', 'bj', 'all'
+    exclude_st: true  # 是否剔除 ST/*ST/退市股
+    max_count: 10     # 限制股票数量（0 表示不限制）
 ```
 
-### 训练提速与数据降噪 (`training_optimization`)
+### 训练提速与数据降噪
+
 ```yaml
 training_optimization:
-  sample_rate: 0.5            # 随机降采样：仅使用 50% 的数据训练 (加快速度防过拟合)
-  drop_middle: true           # 截面极值采样：丢弃中间 40% 表现平庸的样本，迫使模型学习强势股和弱势股
+  sample_rate: 0.5            # 随机降采样：仅使用 50% 的数据训练
+  drop_middle: true           # 截面极值采样：丢弃中间 40% 表现平庸的样本
   drop_middle_threshold: 0.4  # 丢弃阈值范围
 ```
 
-### 数据预处理与防雷 (`preprocessing`)
+### 数据预处理与防雷
+
 ```yaml
 preprocessing:
-  dynamic_filter:
+  dynamic_filter:       # 动态过滤僵尸股与次新股
     enable: true
     min_avg_turnover: 10000000  # 剔除近20日日均成交额低于 1000万 的僵尸股
     min_listed_days: 120        # 剔除上市不满半年的次新股
@@ -168,26 +201,176 @@ preprocessing:
   z_score: true                 # 开启横截面 Z-Score 标准化
 ```
 
-### 建模目标 (`LabelGenerator`)
+### 特征配置
+
 ```yaml
-- name: "LabelGenerator"
-  params: 
-    horizon: 3  # 预测未来3天的表现
-    target_type: "rank_pct" # 强烈推荐：截面收益率百分比排名 (配合 rank:pairwise)
+features:
+  - name: "MarketFactor"        # 大盘基准因子
+    params:
+      index_symbol: "sh.000300"  # 沪深300作为基准
+  - name: "SubjectiveFactor"    # 主观交易逻辑因子
+    params: {}
+  - name: "PatternFactor"        # 形态识别因子
+    params: {}
+  - name: "EventFactor"          # 事件驱动因子
+    params: {}
+  - name: "BoardFactor"          # 行业/概念因子
+    params:
+      encode_method: "category"
+  - name: "FinancialFactor"      # 财务基本面因子
+    params: {}
+  - name: "FundFlowFactor"       # 资金流向因子
+    params: {}
+  - name: "PandasTAFactor"       # 技术指标因子
+    params:
+      strategy: "custom"
+      features: ['MACD_12_26_9', 'RSI_14', 'BBU_5_2.0_2.0', ...]  # 可选技术指标
+  - name: "LabelGenerator"       # 标签生成器
+    params:
+      horizon: 3                # 预测未来3天的表现
+      target_type: "rank_pct"    # 截面收益率百分比排名（配合 rank:pairwise）
 ```
 
-### 策略与风控 (`strategy`)
+**target_type 选项说明：**
+- `regression`: 预测具体收益率数值（对应 `objective: reg:squarederror`）
+- `binary`: 预测涨跌（对应 `objective: binary:logistic`）
+- `classification_3`: 预测大涨(1)、平盘(0)、大跌(-1)（对应 `objective: multi:softmax`）
+- `excess_return_binary`: 预测是否跑赢沪深300
+- `rank_pct`: 截面收益率百分比排名 (0.0~1.0)，**强烈推荐**配合 `rank:pairwise` 使用
+
+### 模型配置
+
+```yaml
+model:
+  name: "XGBoostWrapper"
+  params:
+    objective: "rank:pairwise"  # 使用排序学习目标
+    max_depth: 4
+    eta: 0.1
+    # 其他 XGBoost 参数...
+  save_path: "models/saved/config_xgb.json"
+```
+
+### 策略与风控
+
 ```yaml
 strategy:
   name: "MLStrategy"
   params:
     top_k: 10                   # 每日买入排名前 10 的股票
-    use_market_filter: true     # 大盘风控：指数跌破 20 日线时自动空仓
+    rebalance_period: 1          # 调仓周期（天）
+    use_market_filter: true      # 大盘风控：指数跌破 20 日线时自动空仓
     max_turnover: 0.5           # 换手率控制：每日最多调仓 50%
-    weight_method: "score"      # 资金分配：按预测分数加权买入 (而非等权)
+    weight_method: "score"       # 资金分配：按预测分数加权买入
+  initial_capital: 100000.0     # 初始资金
 ```
 
 ---
 
-## ⚠️ 免责声明 (Disclaimer)
+##  数据流 (Data Flow)
+
+```
+配置文件 (YAML)
+       │
+       ▼
+┌─────────────────┐
+│  PipelineRunner │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐     ┌──────────────────┐
+│ DataRepository  │────▶│   Local Data Lake │
+│ (数据仓库入口)   │     │  (Parquet 文件)   │
+└────────┬────────┘     └──────────────────┘
+         │                      │
+         ▼                      ▼
+┌─────────────────┐     ┌──────────────────┐
+│ StockPoolManager│     │  FeaturePipeline │
+│ (股票池过滤)     │     │  (特征工程流水线)  │
+└────────┬────────┘     └────────┬─────────┘
+         │                      │
+         │         ┌────────────┼────────────┐
+         │         ▼            ▼            ▼
+         │   ┌──────────┐ ┌──────────┐ ┌──────────┐
+         │   │PandasTA  │ │Financial │ │Pattern   │
+         │   │Factor    │ │Factor    │ │Factor    │
+         │   └──────────┘ └──────────┘ └──────────┘
+         │         │            │            │
+         │         └────────────┼────────────┘
+         │                      ▼
+         │            ┌──────────────────┐
+         │            │CrossSectional    │
+         │            │Processor         │
+         │            │(MAD+Z-Score)     │
+         │            └────────┬─────────┘
+         │                     │
+         ▼                     ▼
+┌─────────────────┐     ┌──────────────────┐
+│   XGBoostModel  │◀────│  训练特征矩阵 X   │
+│   (模型训练)     │     │  标签向量 y       │
+└────────┬────────┘     └──────────────────┘
+         │
+         ▼
+┌─────────────────┐
+│  BacktestEngine │◀──── Signals (T日收盘信号)
+│  (T+1执行回测)   │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│   回测报告       │
+│ (收益、最大回撤)  │
+└─────────────────┘
+```
+
+---
+
+##  核心概念 (Core Concepts)
+
+### T+1 交易机制
+
+A股实行 T+1 交易制度，即当日买入的股票不能在当日卖出。本框架严格遵循此规则：
+- **信号生成**: T 日收盘后，根据当日数据生成交易信号
+- **交易执行**: T+1 日开盘价执行买卖操作
+- **涨跌停处理**: 若 T+1 日开盘价触及涨跌停，则跳过该笔交易
+
+### 截面处理 (Cross-Sectional Processing)
+
+为了消除大盘 Beta 波动对因子的影响，本框架在每天的横截面上对因子进行处理：
+
+1. **MAD 去极值**: 对每个因子，计算其中位数绝对偏差 (MAD)，剔除超过 3σ 的异常值
+2. **Z-Score 标准化**: 将因子值转换为标准正态分布，公式: `z = (x - μ) / σ`
+
+### 特征缓存 (Feature Caching)
+
+特征计算（尤其是 130+ 技术指标）是耗时最长的步骤之一。本框架使用配置指纹的 MD5 哈希值作为缓存键：
+- 相同配置下，第二次运行直接读取缓存，速度提升 100 倍以上
+- 缓存目录: `data/local_lake/features/<config_hash>/`
+
+### 排序学习 (Learning to Rank)
+
+相比传统的回归或分类目标，排序学习更适合量化选股场景：
+- **目标**: `rank:pairwise`，优化 pairwise 排序损失
+- **标签**: `rank_pct`，截面收益率百分比排名 (0.0~1.0)
+- **优势**: 解决二分类梯度为0的问题，直接优化相对排序
+
+---
+
+##  关键文件说明
+
+| 文件 | 说明 |
+|------|------|
+| `runner.py` | 核心执行器，解析 YAML 配置并协调整个训练/回测流程 |
+| `data/repository.py` | 数据仓库，统一从 Local Data Lake 加载数据 |
+| `data/pool_manager.py` | 股票池管理，支持板块、交易所过滤和 ST 剔除 |
+| `features/pipeline.py` | 特征流水线，串联所有因子计算 |
+| `features/processor.py` | 横截面处理器，执行 MAD 去极值和 Z-Score 标准化 |
+| `strategies/ml_strategy.py` | ML 选股策略，包含大盘风控和换手率控制 |
+| `backtest/engine.py` | 回测引擎，实现 T+1 交易、涨跌停、印花税、滑点 |
+| `models/xgboost_model.py` | XGBoost 模型封装，支持增量学习和排序目标 |
+
+---
+
+##  免责声明 (Disclaimer)
+
 本项目仅供量化研究与学术交流使用。由于公共数据源（如 Baostock, AkShare）可能存在网络延迟或数据缺失，实盘交易需谨慎评估风险。开发者对使用本项目造成的任何投资损失概不负责。

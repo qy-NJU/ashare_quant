@@ -5,14 +5,26 @@ class DynamicFilter:
     """
     Filters out 'zombie' stocks (low volume/turnover) and newly listed stocks
     based on their time-series data dynamically before they are fed into the model.
+
+    Zombie stocks (僵尸股) are stocks with extremely low trading activity, often manipulated
+    or abandoned by the market. They can cause model overfitting to artificial price movements.
+
+    Newly listed stocks (次新股) often have highly volatile prices due to market sentiment
+    rather than fundamentals, making them unsuitable for modeling.
+
+    Example:
+        >>> filter = DynamicFilter(min_avg_turnover=10_000_000, min_listed_days=120)
+        >>> filtered_df = filter.filter(stock_df)  # For a single stock's time-series
     """
     def __init__(self, min_avg_turnover=10000000, min_listed_days=120):
         """
         Args:
-            min_avg_turnover (float): Minimum 20-day average turnover (成交额) to be considered active.
-                                      Default 10 million (assuming volume is in lots and price is around 10, this needs to be adjusted based on actual data units).
-                                      Baostock volume is in shares, amount is in RMB. If amount is not available, we estimate using volume * close.
+            min_avg_turnover (float): Minimum 20-day average turnover (成交额, in RMB).
+                                      Default 10 million RMB. Stocks below this threshold
+                                      are considered "zombie" and filtered out.
             min_listed_days (int): Minimum number of trading days the stock must have been listed.
+                                   Default 120 days (~6 months). Stocks listed less than this
+                                   are considered "new" and filtered out.
         """
         self.min_avg_turnover = min_avg_turnover
         self.min_listed_days = min_listed_days
@@ -61,7 +73,20 @@ class DynamicFilter:
 class CrossSectionalProcessor:
     """
     Handles cross-sectional feature preprocessing to denoise data and handle extreme values.
-    Typically applied on merged DataFrame of all stocks right before model training/inference.
+
+    Applied on merged DataFrame of ALL stocks right before model training/inference.
+    For each date (cross-section), processes all stocks' features independently.
+
+    Processing steps per date:
+        1. MAD Clipping: Remove extreme outliers beyond 3σ (based on Median Absolute Deviation)
+        2. Z-Score: Normalize to zero mean and unit variance
+
+    This eliminates market-wide noise (Beta) and prevents extreme values from dominating.
+
+    Example:
+        >>> processor = CrossSectionalProcessor(use_mad_clip=True, use_zscore=True)
+        >>> feature_cols = ['MACD_12_26_9', 'RSI_14', 'BBU_5_2.0_2.0']
+        >>> processed_df = processor.process(features_df, feature_cols)
     """
     def __init__(self, use_mad_clip=True, use_zscore=True):
         self.use_mad_clip = use_mad_clip
