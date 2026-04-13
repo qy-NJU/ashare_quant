@@ -46,7 +46,8 @@ ashare_quant/
 │   ├── local_lake/             # 🚀 本地离线数据湖 (Parquet)
 │   │   ├── basics/             # 股票基础信息
 │   │   ├── daily_k/            # 个股日线全量历史数据
-│   │   └── events/             # 离线事件数据池 (如龙虎榜数据)
+│   │   ├── events/             # 离线事件数据池 (如龙虎榜数据)
+│   │   └── features/           # ⚡️ 基于 MD5 配置指纹的特征缓存池
 │   ├── source/                 # 具体数据源实现 (Baostock, AkShare)
 │   ├── repository.py           # 统一的数据仓库入口 (从 local_lake 极速加载)
 │   ├── pool_manager.py         # 股票池过滤器 (板块、交易所过滤)
@@ -98,6 +99,9 @@ pip install pandas numpy xgboost scikit-learn baostock akshare pandas-ta pyyaml 
 # 全量同步所有 A 股日线数据及龙虎榜事件 (耗时较长，建议盘后执行)
 python scripts/sync_data.py
 
+# 指定开始日期同步数据 (增量或指定区间同步)
+python scripts/sync_data.py --start_date 2023-01-01
+
 # 只单独更新最新的事件数据（如龙虎榜）
 python scripts/sync_data.py --events_only
 
@@ -143,6 +147,14 @@ data:
     board: "chinext"    # 可选: 'main'(主板), 'chinext'(创业板), 'star'(科创板), 'all'
     exchange: "sz"      # 可选: 'sh', 'sz', 'bj', 'all'
     max_count: 50       # 测试用，限制股票数量。实盘设为 0
+```
+
+### 训练提速与数据降噪 (`training_optimization`)
+```yaml
+training_optimization:
+  sample_rate: 0.5            # 随机降采样：仅使用 50% 的数据训练 (加快速度防过拟合)
+  drop_middle: true           # 截面极值采样：丢弃中间 40% 表现平庸的样本，迫使模型学习强势股和弱势股
+  drop_middle_threshold: 0.4  # 丢弃阈值范围
 ```
 
 ### 数据预处理与防雷 (`preprocessing`)

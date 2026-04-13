@@ -136,7 +136,7 @@ def sync_lhb_data(start_date='20200101', end_date=None):
     except Exception as e:
         print(f"Failed to fetch LHB data: {e}")
 
-def sync_all_daily_data(symbols_limit=None):
+def sync_all_daily_data(symbols_limit=None, start_date='2020-01-01'):
     source = BaostockSource()
     
     # 1. Sync stock list
@@ -163,7 +163,7 @@ def sync_all_daily_data(symbols_limit=None):
         if count % 100 == 0:
             print(f"Progress: {count}/{len(symbols)}...")
             
-        sync_daily_data_for_symbol(source, sym, start_date='2020-01-01', end_date=end_date)
+        sync_daily_data_for_symbol(source, sym, start_date=start_date, end_date=end_date)
         
         # Simple rate limiting for Baostock
         if count % 50 == 0:
@@ -176,9 +176,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Sync A-Share data to Local Data Lake")
     parser.add_argument('--limit', type=int, default=None, help='Limit number of symbols to sync (for testing)')
     parser.add_argument('--events_only', action='store_true', help='Only sync event data like LHB')
+    parser.add_argument('--start_date', type=str, default='2020-01-01', help='Start date for syncing data (YYYY-MM-DD)')
     args = parser.parse_args()
     
-    sync_lhb_data()
+    # LHB data expects YYYYMMDD format
+    lhb_start_date = args.start_date.replace('-', '')
+    sync_lhb_data(start_date=lhb_start_date)
     
     if not args.events_only:
-        sync_all_daily_data(symbols_limit=args.limit)
+        sync_all_daily_data(symbols_limit=args.limit, start_date=args.start_date)
