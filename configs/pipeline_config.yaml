@@ -85,6 +85,7 @@ pipeline:
       objective: "rank:pairwise"
       max_depth: 4
       eta: 0.1
+    num_boost_round: 50           # 训练轮数，可根据数据量调整（数据量大时可减少防止过拟合）
     save_path: "models/saved/config_xgb.json"
 
   # 策略与回测配置

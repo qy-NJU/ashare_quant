@@ -87,8 +87,11 @@ class PipelineRunner:
         print("Building Model...")
         model_cfg = self.config['model']
         params = model_cfg.get('params', {})
+        num_boost_round = model_cfg.get('num_boost_round', 50)  # 从配置读取，默认50
         if model_cfg['name'] == 'XGBoostWrapper':
-            return XGBoostWrapper(params=params)
+            model = XGBoostWrapper(params=params)
+            model.num_boost_round = num_boost_round  # 存储以供后续使用
+            return model
         else:
             return self._instantiate_class(model_cfg['name'], params)
 
@@ -381,7 +384,8 @@ class PipelineRunner:
                     groups = X_full.groupby(X_full.index).size().values
                 
                 if i == 0:
-                    model.train(X_full, y_full, groups=groups)
+                    model.train(X_full, y_full, groups=groups,
+                                num_boost_round=getattr(model, 'num_boost_round', 50))
                 else:
                     model.partial_train(X_full, y_full, groups=groups)
             else:
