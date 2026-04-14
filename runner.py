@@ -3,6 +3,8 @@ import os
 import pandas as pd
 import hashlib
 import json
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 
 # Import all possible components to make them available for eval/getattr
 from data.repository import DataRepository
@@ -25,6 +27,71 @@ from models.xgboost_model import XGBoostWrapper
 from models.machine_learning import SklearnWrapper
 from strategies.ml_strategy import MLStrategy
 from backtest.engine import BacktestEngine
+
+
+def _compute_stock_features(args):
+    """
+    Worker function for parallel training feature computation.
+    Must be at module level for multiprocessing pickle to work.
+    """
+    sym, start, end, include_label, cache_path, dynamic_filter_config, feature_pipeline_config, benchmark_close, enable_filter = args
+
+    try:
+        # Import inside worker to ensure fresh instances
+        from data.repository import DataRepository
+        from features.processor import DynamicFilter
+        from features.pipeline import FeaturePipeline, FACTOR_MAP
+
+        repo = DataRepository()
+        dynamic_filter = DynamicFilter(**dynamic_filter_config) if dynamic_filter_config and enable_filter else None
+
+        # Reconstruct feature pipeline
+        factors = []
+        for factor_info in feature_pipeline_config:
+            factor_class = FACTOR_MAP[factor_info['class']]
+            factors.append(factor_class(**factor_info.get('params', {})))
+        feature_pipeline = FeaturePipeline(factors)
+
+        # Check cache first
+        if os.path.exists(cache_path):
+            try:
+                features_df = pd.read_parquet(cache_path)
+                return sym, features_df
+            except:
+                pass
+
+        # Load raw data
+        df = repo.get_daily_data(sym, start, end)
+        if df.empty:
+            return sym, pd.DataFrame()
+
+        # Apply Dynamic Filter
+        if dynamic_filter:
+            df = dynamic_filter.filter(df)
+            if df.empty:
+                return sym, pd.DataFrame()
+
+        # Merge benchmark
+        if benchmark_close is not None and not pd.isna(benchmark_close):
+            df['benchmark_close'] = benchmark_close
+
+        # Add symbol column
+        df['symbol'] = sym
+
+        # Compute features
+        features_df = feature_pipeline.transform(df)
+        if features_df.empty:
+            return sym, pd.DataFrame()
+
+        # Save to cache
+        try:
+            features_df.to_parquet(cache_path, engine='pyarrow')
+        except:
+            pass
+
+        return sym, features_df
+    except Exception as e:
+        return sym, pd.DataFrame()
 
 class PipelineRunner:
     def __init__(self, config_path):
@@ -76,12 +143,49 @@ class PipelineRunner:
         # Create a deterministic string representation of the features config
         config_str = json.dumps(self.config['features'], sort_keys=True)
         config_hash = hashlib.md5(config_str.encode('utf-8')).hexdigest()[:8]
-        
+
         cache_dir = os.path.join(self.config['data'].get('cache_dir', 'data/local_lake'), 'features', config_hash)
         os.makedirs(cache_dir, exist_ok=True)
-        
+
         label_str = "with_label" if include_label else "no_label"
         return os.path.join(cache_dir, f"{symbol}_{start}_{end}_{label_str}.parquet")
+
+    def _serialize_feature_pipeline_config(self, feature_pipeline):
+        """
+        Serialize feature pipeline config for multiprocessing workers.
+        """
+        config = []
+        for factor in feature_pipeline.factors:
+            class_name = factor.__class__.__name__
+            params = {}
+
+            # Known init param names for each factor class
+            if class_name == 'PandasTAFactor':
+                params = {'name': factor.name, 'strategy': getattr(factor, 'strategy_mode', 'default'),
+                         'features': getattr(factor, 'features', None)}
+            elif class_name == 'BoardFactor':
+                params = {'name': factor.name, 'encode_method': getattr(factor, 'encode_method', 'category')}
+            elif class_name == 'FinancialFactor':
+                params = {'name': factor.name, 'cache_dir': getattr(factor, 'cache_dir', 'data/cache')}
+            elif class_name == 'FundFlowFactor':
+                params = {'name': factor.name, 'cache_dir': getattr(factor, 'cache_dir', 'data/cache')}
+            elif class_name == 'MarketFactor':
+                params = {'name': factor.name, 'index_symbol': getattr(factor, 'index_symbol', 'sh.000300')}
+            elif class_name == 'EventFactor':
+                params = {'name': factor.name}
+            elif class_name == 'SubjectiveFactor':
+                params = {'name': factor.name}
+            elif class_name == 'PatternFactor':
+                params = {'name': factor.name}
+            elif class_name == 'LabelGenerator':
+                params = {'horizon': getattr(factor, 'horizon', 5),
+                         'target_type': getattr(factor, 'target_type', 'regression')}
+
+            # Remove None values
+            params = {k: v for k, v in params.items() if v is not None}
+            config.append({'class': class_name, 'params': params})
+
+        return config
 
     def build_model(self):
         print("Building Model...")
@@ -275,69 +379,86 @@ class PipelineRunner:
             drop_middle = opt_cfg.get('drop_middle', False)
             drop_middle_threshold = opt_cfg.get('drop_middle_threshold', 0.3)
             
-            for sym in symbols:
-                # 1. Try to load from Feature Cache
-                cache_path = self._get_feature_cache_path(sym, start, end, include_label=True)
-                
-                if os.path.exists(cache_path):
-                    try:
-                        features_df = pd.read_parquet(cache_path)
-                        # We still need to apply dynamic filter on loaded features if required
-                        # But wait, dynamic filter needs volume/amount/close. 
-                        # We should have them in features_df if we didn't drop them yet.
-                    except Exception as e:
-                        features_df = pd.DataFrame()
-                else:
-                    features_df = pd.DataFrame()
-                    
-                if features_df.empty:
-                    df = repo.get_daily_data(sym, start, end)
-                    if df.empty: continue
-                    
-                    # Apply Dynamic Filter (Zombie stocks, New stocks)
-                    if enable_filter:
-                        df = dynamic_filter.filter(df)
-                        if df.empty: continue
-                    
-                    # Merge benchmark close if needed for excess return
-                    if not benchmark_df.empty:
-                        # Align by date index
-                        try:
-                            df = df.join(benchmark_df['close'].rename('benchmark_close'), how='left')
-                        except Exception as e:
-                            pass
-                    
-                    # Add symbol column for fundamental/board/subjective features to map correctly
-                    df['symbol'] = sym
-                    
-                    features_df = train_pipeline.transform(df)
-                    if features_df.empty: continue
-                    
-                    # Save to Feature Cache
-                    try:
-                        features_df.to_parquet(cache_path, engine='pyarrow')
-                    except Exception as e:
-                        pass
-                
-                target_col = [c for c in features_df.columns if c.startswith('target_')]
-                if not target_col: continue
-                target_col = target_col[0]
-                
-                features_df = features_df.dropna(subset=[target_col])
-                
-                # Apply Data Sampling (Random Downsampling)
-                if sample_rate < 1.0:
-                    features_df = features_df.sample(frac=sample_rate, random_state=42)
-                    
-                if features_df.empty: continue
+            # Serialize configs for parallel workers
+            dynamic_filter_config = None
+            if enable_filter and dynamic_filter:
+                dynamic_filter_config = {
+                    'min_avg_turnover': dynamic_filter.min_avg_turnover,
+                    'min_listed_days': dynamic_filter.min_listed_days
+                }
+            feature_pipeline_config = self._serialize_feature_pipeline_config(train_pipeline)
+            benchmark_close = benchmark_df['close'].iloc[-1] if not benchmark_df.empty else None
 
-                X = features_df.drop(columns=[target_col, 'open', 'high', 'low', 'close', 'volume', 'date', 'symbol'], errors='ignore')
-                # Keep only numeric and category columns (XGBoost cannot handle string/object columns)
-                X = X.select_dtypes(include=['number', 'category'])
-                y = features_df[target_col]
-                
-                X_batch.append(X)
-                y_batch.append(y)
+            # Prepare tasks: first check cache, only compute if not cached
+            tasks = []
+            for sym in symbols:
+                cache_path = self._get_feature_cache_path(sym, start, end, include_label=True)
+                if not os.path.exists(cache_path):
+                    tasks.append((sym, start, end, include_label, cache_path,
+                                  dynamic_filter_config, feature_pipeline_config, benchmark_close, enable_filter))
+
+            # Parallel feature computation
+            if tasks:
+                num_workers = min(mp.cpu_count(), len(tasks), 8)
+                print(f"Computing features for {len(tasks)} stocks in parallel ({num_workers} workers)...")
+                with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                    futures = {executor.submit(_compute_stock_features, task): task[0] for task in tasks}
+                    for future in as_completed(futures):
+                        sym, features_df = future.result()
+                        if features_df.empty:
+                            continue
+
+                        target_col = [c for c in features_df.columns if c.startswith('target_')]
+                        if not target_col:
+                            continue
+                        target_col = target_col[0]
+
+                        features_df = features_df.dropna(subset=[target_col])
+
+                        # Apply Data Sampling (Random Downsampling)
+                        if sample_rate < 1.0:
+                            features_df = features_df.sample(frac=sample_rate, random_state=42)
+
+                        if features_df.empty:
+                            continue
+
+                        X = features_df.drop(columns=[target_col, 'open', 'high', 'low', 'close', 'volume', 'date', 'symbol'], errors='ignore')
+                        X = X.select_dtypes(include=['number', 'category'])
+                        y = features_df[target_col]
+
+                        X_batch.append(X)
+                        y_batch.append(y)
+
+            # Load cached features for remaining symbols (not in tasks)
+            cached_symbols = [s for s in symbols if s not in [t[0] for t in tasks]]
+            for sym in cached_symbols:
+                cache_path = self._get_feature_cache_path(sym, start, end, include_label=True)
+                try:
+                    features_df = pd.read_parquet(cache_path)
+                    if features_df.empty:
+                        continue
+
+                    target_col = [c for c in features_df.columns if c.startswith('target_')]
+                    if not target_col:
+                        continue
+                    target_col = target_col[0]
+
+                    features_df = features_df.dropna(subset=[target_col])
+
+                    if sample_rate < 1.0:
+                        features_df = features_df.sample(frac=sample_rate, random_state=42)
+
+                    if features_df.empty:
+                        continue
+
+                    X = features_df.drop(columns=[target_col, 'open', 'high', 'low', 'close', 'volume', 'date', 'symbol'], errors='ignore')
+                    X = X.select_dtypes(include=['number', 'category'])
+                    y = features_df[target_col]
+
+                    X_batch.append(X)
+                    y_batch.append(y)
+                except:
+                    continue
                 
             if X_batch:
                 # Keep original index (dates) for proper groupby in ranking
