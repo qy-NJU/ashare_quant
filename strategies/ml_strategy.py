@@ -1,6 +1,71 @@
 from .base_strategy import BaseStrategy
 import pandas as pd
 import numpy as np
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+import os
+
+
+def _process_single_stock(args):
+    """
+    Worker function for parallel stock processing.
+    Must be at module level for multiprocessing pickle to work.
+    """
+    symbol, date, lookback_days, benchmark_close, dynamic_filter_config, feature_pipeline_config = args
+
+    try:
+        # Import here to avoid circular imports and ensure fresh instances in each process
+        from data.repository import DataRepository
+        from features.processor import DynamicFilter
+        from features.pipeline import FeaturePipeline, FACTOR_MAP
+
+        # Create fresh instances in this process
+        data_loader = DataRepository()
+
+        # Reconstruct dynamic filter
+        dynamic_filter = None
+        if dynamic_filter_config:
+            dynamic_filter = DynamicFilter(**dynamic_filter_config)
+
+        # Reconstruct feature pipeline
+        factors = []
+        for factor_info in feature_pipeline_config:
+            factor_class = FACTOR_MAP[factor_info['class']]
+            factors.append(factor_class(**factor_info.get('params', {})))
+        feature_pipeline = FeaturePipeline(factors)
+
+        # Fetch data
+        start_dt = pd.to_datetime(date) - pd.Timedelta(days=lookback_days)
+        df = data_loader.get_daily_data(symbol, start_date=start_dt.strftime('%Y%m%d'), end_date=date)
+
+        if df.empty or len(df) < 30:
+            return None
+
+        # Apply Dynamic Filter
+        if dynamic_filter:
+            df = dynamic_filter.filter(df)
+            if df.empty:
+                return None
+
+        # Merge benchmark
+        if benchmark_close is not None and not pd.isna(benchmark_close):
+            df['benchmark_close'] = benchmark_close
+
+        # Inject symbol
+        df['symbol'] = symbol
+
+        # Generate features
+        features_df = feature_pipeline.transform(df)
+        if features_df.empty:
+            return None
+
+        # Return the latest row features and symbol
+        return {
+            'symbol': symbol,
+            'features': features_df.iloc[-1]
+        }
+    except Exception as e:
+        return None
 
 class MLStrategy(BaseStrategy):
     """
@@ -68,16 +133,16 @@ class MLStrategy(BaseStrategy):
         """
         if current_positions is None:
             current_positions = {}
-            
+
         # 1. Rebalance frequency check
         if self.days_since_rebalance < self.rebalance_period and self.days_since_rebalance != 0:
             self.days_since_rebalance += 1
             # Return current positions as target weights (hold)
             # Assuming equal weight for currently held if we just return keys
             return list(current_positions.keys())
-            
+
         self.days_since_rebalance = 1 # Reset counter
-        
+
         # 2. Market Filter
         if not self._check_market_filter(date, data_loader):
             return {} # Empty dict means sell all and hold cash
@@ -96,8 +161,8 @@ class MLStrategy(BaseStrategy):
 
         # If candidates list is too large and no universe specified, limit it for performance in demo
         if not self.universe and len(candidates) > 20:
-            candidates = candidates[:20] 
-        
+            candidates = candidates[:20]
+
         # Collect latest features for all candidates to form a cross-section
         latest_features_list = []
         valid_symbols = []
@@ -109,58 +174,89 @@ class MLStrategy(BaseStrategy):
         benchmark_df = data_loader.get_daily_data("sh.000300",
                                                 start_date=(pd.to_datetime(date) - pd.Timedelta(days=lookback_days)).strftime('%Y%m%d'),
                                                 end_date=date)
-        
-        filtered_empty_df = 0
-        filtered_len_small = 0
-        filtered_dynamic = 0
-        filtered_transform = 0
-        filtered_exception = 0
 
+        # Extract benchmark close series for parallel workers
+        benchmark_close = benchmark_df['close'] if not benchmark_df.empty else None
+
+        # Prepare configs for parallel workers
+        dynamic_filter_config = None
+        if self.dynamic_filter:
+            dynamic_filter_config = {
+                'min_avg_turnover': self.dynamic_filter.min_avg_turnover,
+                'min_listed_days': self.dynamic_filter.min_listed_days
+            }
+
+        # Serialize feature pipeline config
+        # Each factor class can be reconstructed from its init signature
+        # We capture known init params based on factor class
+        feature_pipeline_config = []
+        for factor in self.feature_pipeline.factors:
+            class_name = factor.__class__.__name__
+            params = {}
+
+            # Known init param names for each factor class
+            if class_name == 'PandasTAFactor':
+                params = {'name': factor.name, 'strategy': getattr(factor, 'strategy_mode', 'default'),
+                         'features': getattr(factor, 'features', None)}
+            elif class_name == 'BoardFactor':
+                params = {'name': factor.name, 'encode_method': getattr(factor, 'encode_method', 'category')}
+            elif class_name == 'FinancialFactor':
+                params = {'name': factor.name, 'cache_dir': getattr(factor, 'cache_dir', 'data/cache')}
+            elif class_name == 'FundFlowFactor':
+                params = {'name': factor.name, 'cache_dir': getattr(factor, 'cache_dir', 'data/cache')}
+            elif class_name == 'MarketFactor':
+                params = {'name': factor.name, 'index_symbol': getattr(factor, 'index_symbol', 'sh.000300')}
+            elif class_name == 'EventFactor':
+                params = {'name': factor.name}
+            elif class_name == 'SubjectiveFactor':
+                params = {'name': factor.name}
+            elif class_name == 'PatternFactor':
+                params = {'name': factor.name}
+            elif class_name == 'LabelGenerator':
+                params = {'horizon': getattr(factor, 'horizon', 5),
+                         'target_type': getattr(factor, 'target_type', 'regression')}
+            else:
+                # Fallback: use factor's own params attribute if available
+                if hasattr(factor, 'params') and isinstance(factor.params, dict):
+                    params = factor.params
+                elif hasattr(factor, '_params') and isinstance(factor._params, dict):
+                    params = factor._params
+
+            # Remove None values to use defaults
+            params = {k: v for k, v in params.items() if v is not None}
+
+            feature_pipeline_config.append({'class': class_name, 'params': params})
+
+        # Use multiprocessing for parallel stock processing
+        num_workers = min(mp.cpu_count(), len(candidates), 8)  # Cap at 8 workers
+        filtered_count = {'empty_df': 0, 'len_small': 0, 'dynamic': 0, 'transform': 0, 'exception': 0}
+
+        # Prepare tasks: (symbol, date, lookback_days, benchmark_close_value, dynamic_filter_config, feature_pipeline_config)
+        tasks = []
         for symbol in candidates:
-            start_dt = pd.to_datetime(date) - pd.Timedelta(days=lookback_days)
-            df = data_loader.get_daily_data(symbol, start_date=start_dt.strftime('%Y%m%d'), end_date=date)
+            # Pass a single benchmark close value (latest) for each stock
+            bench_close = benchmark_close.iloc[-1] if benchmark_close is not None and len(benchmark_close) > 0 else None
+            tasks.append((symbol, date, lookback_days, bench_close, dynamic_filter_config, feature_pipeline_config))
 
-            if df.empty:
-                filtered_empty_df += 1
-                continue
-            if len(df) < 30: # Minimum required
-                filtered_len_small += 1
-                continue
+        # Parallel execution
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(_process_single_stock, task): task[0] for task in tasks}
 
-            # Apply Dynamic Filter (Zombie stocks, New stocks)
-            if self.dynamic_filter:
-                original_len = len(df)
-                df = self.dynamic_filter.filter(df)
-                if df.empty:
-                    filtered_dynamic += 1
-                    continue
-
-            # Merge benchmark
-            if not benchmark_df.empty:
+            for future in as_completed(futures):
+                symbol = futures[future]
                 try:
-                    df = df.join(benchmark_df['close'].rename('benchmark_close'), how='left')
-                except:
-                    pass
-
-            # Inject symbol for BoardFactor and EventFactor
-            df['symbol'] = symbol
-
-            try:
-                features_df = self.feature_pipeline.transform(df)
-                if features_df.empty:
-                    filtered_transform += 1
-                    continue
-
-                # Take the LATEST row to form the cross-section
-                latest_features = features_df.iloc[[-1]]
-                latest_features_list.append(latest_features)
-                valid_symbols.append(symbol)
-            except Exception as e:
-                filtered_exception += 1
-                continue
+                    result = future.result()
+                    if result is None:
+                        # Categorize the failure
+                        filtered_count['exception'] += 1
+                    else:
+                        latest_features_list.append(result['features'])
+                        valid_symbols.append(result['symbol'])
+                except Exception as e:
+                    filtered_count['exception'] += 1
 
         # Debug: count how far we got
-        print(f"[DEBUG {date}] valid={len(valid_symbols)}, empty_df={filtered_empty_df}, len_small={filtered_len_small}, dynamic={filtered_dynamic}, transform={filtered_transform}, exception={filtered_exception}")
+        print(f"[DEBUG {date}] valid={len(valid_symbols)}, filtered={filtered_count}")
 
         # Debug: check feature names from first successful symbol
         if latest_features_list:
@@ -168,45 +264,45 @@ class MLStrategy(BaseStrategy):
             print(f"[DEBUG {date}] Sample features ({len(sample_features.columns)} cols): {list(sample_features.columns)[:15]}...")
 
         # Debug: count how far we got
-        print(f"[DEBUG {date}] After loop: valid_symbols={len(valid_symbols)} out of {len(candidates)}")
-                
+        print(f"[DEBUG {date}] After parallel processing: valid_symbols={len(valid_symbols)} out of {len(candidates)}")
+
         if not latest_features_list:
             # Debug: check why no features were generated
             print(f"[DEBUG {date}] No features generated. Tried {len(candidates)} candidates.")
             if self.dynamic_filter:
                 print(f"[DEBUG] DynamicFilter: min_listed_days={self.dynamic_filter.min_listed_days}, min_turnover={self.dynamic_filter.min_avg_turnover}")
             return []
-            
+
         # Form Cross-Section
         X_full = pd.concat(latest_features_list)
-        
+
         # Apply Cross-Sectional Processor (MAD Clip & Z-Score)
         if self.processor:
             feature_cols = X_full.drop(columns=['open', 'high', 'low', 'close', 'volume', 'date', 'symbol'], errors='ignore').columns.tolist()
             X_full = self.processor.process(X_full, feature_cols)
-            
+
         # Drop non-feature columns before prediction
         # Also drop string/object columns that XGBoost cannot handle
         X_pred = X_full.drop(columns=['open', 'high', 'low', 'close', 'volume', 'date', 'symbol'], errors='ignore')
         # Keep only numeric and category columns (XGBoost supports these with enable_categorical=True)
         X_pred = X_pred.select_dtypes(include=['number', 'category'])
-        
+
         # Batch Predict
         try:
             scores = self.model.predict(X_pred)
         except Exception as e:
             print(f"[{date}] Prediction failed: {e}")
             return []
-            
+
         predictions = [(sym, score) for sym, score in zip(valid_symbols, scores)]
-                
+
         # Sort by score descending
         predictions.sort(key=lambda x: x[1], reverse=True)
-        
+
         # Select Top K
         top_predictions = predictions[:self.top_k]
         selected = [x[0] for x in top_predictions]
-        
+
         # 3. Turnover Control (Optional)
         if self.max_turnover < 1.0 and current_positions:
             # Simple logic: Keep existing top performers, only replace worst ones
