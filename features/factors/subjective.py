@@ -33,10 +33,11 @@ class SubjectiveFactor(BaseFactor):
         result['sub_is_limit_down'] = (df['close'] <= limit_down_price + 0.01).astype(int)
         
         # Premium: Yesterday's limit up stocks opening/high today
+        # Fill with 0 instead of NaN so the feature is always available for the model
         result['sub_high_premium_tags'] = np.where(
             result['sub_is_limit_up'].shift(1) == 1,
             (df['high'] / pre_close) - 1,
-            np.nan
+            0.0  # Default to 0 when not a post-limit-up day
         )
         
         # 2. 资金共识因子 (Turnover Breakout)

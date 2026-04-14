@@ -19,7 +19,7 @@ class EventFactor(BaseFactor):
         if not self.lhb_df.empty:
             # Clean and prepare LHB data
             # AkShare columns typically include: '上榜日期', '代码', '名称', '龙虎榜净买额', '买入额', '卖出额', '换手率', '市场总成交额', etc.
-            self.lhb_df['date'] = pd.to_datetime(self.lhb_df['上榜日期'])
+            self.lhb_df['date'] = pd.to_datetime(self.lhb_df['上榜日'])
             
             # Format symbol to match Baostock format ('sh.600000', 'sz.000001')
             def format_symbol(code):

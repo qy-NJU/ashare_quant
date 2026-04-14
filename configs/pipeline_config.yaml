@@ -15,7 +15,7 @@ pipeline:
       board: "all"        # 跑全市场 A 股
       exchange: "all"     
       exclude_st: true    # 是否剔除 ST/*ST/退市股，过滤垃圾股防雷
-      max_count: 50       # 为了跑得快点，这里限制前 10 只（如果要全市场，设为0，但这会下载很久）
+      max_count: 0       # 为了跑得快点，这里限制前 10 只（如果要全市场，设为0，但这会下载很久）
 
   # 训练加速与数据降噪优化
   training_optimization:

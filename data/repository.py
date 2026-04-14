@@ -67,8 +67,8 @@ class DataRepository:
             end_date (str): Filter events on or before this date (YYYY-MM-DD).
 
         Returns:
-            pd.DataFrame: Event data with columns like '上榜日期', '股票代码', '营业部名称',
-                          '买入金额', '卖出金额', etc. Returns empty DataFrame if no data.
+            pd.DataFrame: Event data with columns like '上榜日', '代码', '名称',
+                          '龙虎榜净买额', '龙虎榜买入额', etc. Returns empty DataFrame if no data.
         """
         cache_file = os.path.join(self.events_dir, 'lhb_data.parquet')
 
@@ -80,14 +80,18 @@ class DataRepository:
             if df.empty:
                 return df
 
-            # Ensure '上榜日期' (list date) is datetime
-            df['上榜日期'] = pd.to_datetime(df['上榜日期'])
+            # Ensure '上榜日' (list date) is datetime - note: column is '上榜日' not '上榜日期'
+            if '上榜日' in df.columns:
+                df['上榜日'] = pd.to_datetime(df['上榜日'])
+            elif '上榜日期' in df.columns:
+                df['上榜日期'] = pd.to_datetime(df['上榜日期'])
 
             # Apply date filters
+            date_col = '上榜日' if '上榜日' in df.columns else '上榜日期'
             if start_date:
-                df = df[df['上榜日期'] >= pd.to_datetime(start_date)]
+                df = df[df[date_col] >= pd.to_datetime(start_date)]
             if end_date:
-                df = df[df['上榜日期'] <= pd.to_datetime(end_date)]
+                df = df[df[date_col] <= pd.to_datetime(end_date)]
 
             return df
         except Exception as e:

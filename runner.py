@@ -330,16 +330,19 @@ class PipelineRunner:
                     features_df = features_df.sample(frac=sample_rate, random_state=42)
                     
                 if features_df.empty: continue
-                
+
                 X = features_df.drop(columns=[target_col, 'open', 'high', 'low', 'close', 'volume', 'date', 'symbol'], errors='ignore')
+                # Keep only numeric and category columns (XGBoost cannot handle string/object columns)
+                X = X.select_dtypes(include=['number', 'category'])
                 y = features_df[target_col]
                 
                 X_batch.append(X)
                 y_batch.append(y)
                 
             if X_batch:
-                X_full = pd.concat(X_batch, ignore_index=True)
-                y_full = pd.concat(y_batch, ignore_index=True)
+                # Keep original index (dates) for proper groupby in ranking
+                X_full = pd.concat(X_batch)
+                y_full = pd.concat(y_batch)
                 
                 # Ensure X_full has unique columns
                 X_full = X_full.loc[:, ~X_full.columns.duplicated()]

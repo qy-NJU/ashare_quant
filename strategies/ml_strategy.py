@@ -101,47 +101,80 @@ class MLStrategy(BaseStrategy):
         # Collect latest features for all candidates to form a cross-section
         latest_features_list = []
         valid_symbols = []
-        
+
         # We need benchmark close for some factors
-        benchmark_df = data_loader.get_daily_data("sh.000300", 
-                                                start_date=(pd.to_datetime(date) - pd.Timedelta(days=100)).strftime('%Y%m%d'), 
+        # Fetch enough history: min_listed_days (120) + buffer for rolling calculations (~80 for safety)
+        # This ensures stocks listed 120+ days ago have valid rows after dynamic_filter
+        lookback_days = max(220, self.dynamic_filter.min_listed_days + 100) if self.dynamic_filter else 220
+        benchmark_df = data_loader.get_daily_data("sh.000300",
+                                                start_date=(pd.to_datetime(date) - pd.Timedelta(days=lookback_days)).strftime('%Y%m%d'),
                                                 end_date=date)
         
+        filtered_empty_df = 0
+        filtered_len_small = 0
+        filtered_dynamic = 0
+        filtered_transform = 0
+        filtered_exception = 0
+
         for symbol in candidates:
-            start_dt = pd.to_datetime(date) - pd.Timedelta(days=100)
+            start_dt = pd.to_datetime(date) - pd.Timedelta(days=lookback_days)
             df = data_loader.get_daily_data(symbol, start_date=start_dt.strftime('%Y%m%d'), end_date=date)
-            
-            if df.empty or len(df) < 30: # Minimum required
+
+            if df.empty:
+                filtered_empty_df += 1
                 continue
-                
+            if len(df) < 30: # Minimum required
+                filtered_len_small += 1
+                continue
+
             # Apply Dynamic Filter (Zombie stocks, New stocks)
             if self.dynamic_filter:
+                original_len = len(df)
                 df = self.dynamic_filter.filter(df)
-                if df.empty: continue
-            
+                if df.empty:
+                    filtered_dynamic += 1
+                    continue
+
             # Merge benchmark
             if not benchmark_df.empty:
                 try:
                     df = df.join(benchmark_df['close'].rename('benchmark_close'), how='left')
                 except:
                     pass
-            
+
             # Inject symbol for BoardFactor and EventFactor
             df['symbol'] = symbol
-                
+
             try:
                 features_df = self.feature_pipeline.transform(df)
                 if features_df.empty:
+                    filtered_transform += 1
                     continue
-                
+
                 # Take the LATEST row to form the cross-section
-                latest_features = features_df.iloc[[-1]] 
+                latest_features = features_df.iloc[[-1]]
                 latest_features_list.append(latest_features)
                 valid_symbols.append(symbol)
             except Exception as e:
+                filtered_exception += 1
                 continue
+
+        # Debug: count how far we got
+        print(f"[DEBUG {date}] valid={len(valid_symbols)}, empty_df={filtered_empty_df}, len_small={filtered_len_small}, dynamic={filtered_dynamic}, transform={filtered_transform}, exception={filtered_exception}")
+
+        # Debug: check feature names from first successful symbol
+        if latest_features_list:
+            sample_features = latest_features_list[0]
+            print(f"[DEBUG {date}] Sample features ({len(sample_features.columns)} cols): {list(sample_features.columns)[:15]}...")
+
+        # Debug: count how far we got
+        print(f"[DEBUG {date}] After loop: valid_symbols={len(valid_symbols)} out of {len(candidates)}")
                 
         if not latest_features_list:
+            # Debug: check why no features were generated
+            print(f"[DEBUG {date}] No features generated. Tried {len(candidates)} candidates.")
+            if self.dynamic_filter:
+                print(f"[DEBUG] DynamicFilter: min_listed_days={self.dynamic_filter.min_listed_days}, min_turnover={self.dynamic_filter.min_avg_turnover}")
             return []
             
         # Form Cross-Section
@@ -153,7 +186,10 @@ class MLStrategy(BaseStrategy):
             X_full = self.processor.process(X_full, feature_cols)
             
         # Drop non-feature columns before prediction
+        # Also drop string/object columns that XGBoost cannot handle
         X_pred = X_full.drop(columns=['open', 'high', 'low', 'close', 'volume', 'date', 'symbol'], errors='ignore')
+        # Keep only numeric and category columns (XGBoost supports these with enable_categorical=True)
+        X_pred = X_pred.select_dtypes(include=['number', 'category'])
         
         # Batch Predict
         try:

@@ -82,6 +82,8 @@ class XGBoostWrapper(BaseModel):
         self.booster = None
         # Store training history for analysis
         self.train_history = []
+        # Store feature names from training for consistent prediction
+        self.feature_names = None
 
     def _prepare_data(self, X):
         """
@@ -132,6 +134,8 @@ class XGBoostWrapper(BaseModel):
             dict: Training result with metrics
         """
         X_clean = self._prepare_data(X)
+        # Save feature names for consistent prediction
+        self.feature_names = list(X_clean.columns)
         dtrain = xgb.DMatrix(X_clean, label=y, enable_categorical=True)
 
         if groups is not None:
@@ -160,7 +164,8 @@ class XGBoostWrapper(BaseModel):
         if 'eval_metric' not in train_params:
             train_params['eval_metric'] = eval_metric
 
-        # Train
+        # Train with progress logging every 10 rounds
+        print(f"[{self.name}] Training with {num_boost_round} rounds, objective: {self.params.get('objective', 'unknown')}")
         if use_early_stop:
             self.booster = xgb.train(
                 train_params,
@@ -168,7 +173,7 @@ class XGBoostWrapper(BaseModel):
                 num_boost_round=num_boost_round,
                 evals=evals,
                 early_stopping_rounds=early_stopping_rounds,
-                verbose_eval=False
+                verbose_eval=10
             )
             best_iteration = self.booster.best_iteration
             best_score = self.booster.best_score
@@ -179,7 +184,7 @@ class XGBoostWrapper(BaseModel):
                 train_params,
                 dtrain,
                 num_boost_round=num_boost_round,
-                verbose_eval=False
+                verbose_eval=10
             )
             # Calculate training metric on full training set
             if eval_metric == 'auc':
@@ -249,11 +254,14 @@ class XGBoostWrapper(BaseModel):
         incremental_params['eta'] = original_eta * 0.5  # Halve the learning rate
 
         # Continue training from existing booster with reduced learning rate
+        print(f"[{self.name}] Incremental training for {num_boost_round} rounds "
+              f"(eta={incremental_params['eta']:.4f})...")
         self.booster = xgb.train(
             incremental_params,
             dtrain,
             num_boost_round=num_boost_round,
-            xgb_model=self.booster
+            xgb_model=self.booster,
+            verbose_eval=5
         )
         print(f"[{self.name}] Incremental training complete. "
               f"(eta reduced to {incremental_params['eta']:.4f} for stability)")
@@ -269,6 +277,14 @@ class XGBoostWrapper(BaseModel):
         if self.booster is None:
             raise ValueError("Model is not trained yet.")
         X_clean = self._prepare_data(X)
+        # Ensure features match training order using saved feature_names
+        if self.feature_names is not None:
+            # Only keep features that were used in training, in the same order
+            available_features = [f for f in self.feature_names if f in X_clean.columns]
+            X_clean = X_clean[available_features]
+        # Debug: log feature info
+        print(f"[DEBUG predict] X_clean shape: {X_clean.shape}, columns: {list(X_clean.columns)[:10]}...")
+        print(f"[DEBUG predict] self.feature_names: {self.feature_names[:10] if self.feature_names else None}...")
         dtest = xgb.DMatrix(X_clean, enable_categorical=True)
         return self.booster.predict(dtest)
 
@@ -364,7 +380,8 @@ class XGBoostWrapper(BaseModel):
             import json
             meta = {
                 'params': self.params,
-                'train_history': self.train_history
+                'train_history': self.train_history,
+                'feature_names': self.feature_names
             }
             with open(meta_path, 'w') as f:
                 json.dump(meta, f, indent=2)
@@ -385,5 +402,6 @@ class XGBoostWrapper(BaseModel):
                     meta = json.load(f)
                 self.params = meta.get('params', self.params)
                 self.train_history = meta.get('train_history', [])
+                self.feature_names = meta.get('feature_names', None)
         else:
             print(f"File {path} not found.")

@@ -34,12 +34,19 @@ class DynamicFilter:
         Filter the DataFrame for a single stock.
         Returns an empty DataFrame if the stock does not meet the criteria on the LAST day.
         Or filters out rows where criteria are not met.
-        
+
         Args:
             df (pd.DataFrame): Time-series DataFrame for a SINGLE stock.
         """
-        if df.empty or len(df) < self.min_listed_days:
-            # print(f"Filtered out due to insufficient history ({len(df)} < {self.min_listed_days} days)")
+        if df.empty:
+            return pd.DataFrame()
+
+        # Check if the data spans enough calendar days (not just row count)
+        # This handles the case where we fetch a limited window but the stock has been listed long enough
+        calendar_days_span = (df.index[-1] - df.index[0]).days if len(df) > 1 else 0
+        if calendar_days_span < self.min_listed_days:
+            # Not enough calendar days in fetched data to satisfy min_listed_days requirement
+            # Even if the stock was listed before our fetch window, we don't have enough history
             return pd.DataFrame()
             
         # Estimate turnover (成交额) if 'amount' column doesn't exist
@@ -52,13 +59,15 @@ class DynamicFilter:
         # Calculate 20-day moving average of turnover
         avg_turnover_20d = turnover.rolling(window=20).mean()
         
-        # We want to keep rows where the stock has been listed for at least min_listed_days 
+        # We want to keep rows where the stock has been listed for at least min_listed_days
         # AND its recent 20-day avg turnover > min_avg_turnover
-        
+
         # Create a mask for valid rows
-        # 1. Listed days condition: row index must be >= min_listed_days
-        valid_history_mask = np.arange(len(df)) >= self.min_listed_days
-        
+        # 1. Listed days condition: use actual calendar days since first data point
+        # (This correctly handles cases where the stock was listed less than min_listed_days ago)
+        days_since_first = (df.index - df.index[0]).days
+        valid_history_mask = days_since_first >= self.min_listed_days
+
         # 2. Turnover condition
         valid_turnover_mask = avg_turnover_20d >= self.min_avg_turnover
         
@@ -157,7 +166,15 @@ class CrossSectionalProcessor:
                 processed_df[col] = processed_df.groupby(level=0)[col].transform(self._mad_clip)
                 
             # 2. Z-Score Normalization
+            # Skip Z-Score for columns with near-zero variance within any group
+            # (these features have no cross-sectional discrimination power)
             if self.use_zscore:
-                processed_df[col] = processed_df.groupby(level=0)[col].transform(self._zscore)
-                
+                group_stds = processed_df.groupby(level=0)[col].std()
+                # Only apply Z-Score if std > 1e-8 for at least one group
+                if group_stds.max() > 1e-8:
+                    processed_df[col] = processed_df.groupby(level=0)[col].transform(self._zscore)
+                else:
+                    # Set to 0 to indicate no discrimination power
+                    processed_df[col] = 0.0
+
         return processed_df
