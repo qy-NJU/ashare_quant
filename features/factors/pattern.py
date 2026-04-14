@@ -20,6 +20,9 @@ class PatternFactor(BaseFactor):
         vol = df['volume']
         pre_close = df['pre_close'] if 'pre_close' in df.columns else close.shift(1)
         
+        # Create a new DataFrame for results to avoid modifying input df
+        result = pd.DataFrame(index=df.index)
+        
         # 1. 均线多头排列 (Bullish MA Alignment)
         # Short MA > Medium MA > Long MA, and trend is upwards
         ma5 = close.rolling(5).mean()
@@ -27,7 +30,7 @@ class PatternFactor(BaseFactor):
         ma20 = close.rolling(20).mean()
         ma60 = close.rolling(60).mean()
         
-        df['pat_bullish_ma'] = (
+        result['pat_bullish_ma'] = (
             (ma5 > ma10) & 
             (ma10 > ma20) & 
             (ma20 > ma60) & 
@@ -46,7 +49,7 @@ class PatternFactor(BaseFactor):
         # Breakout condition: Close > Max of past 20 days, and Volume > 1.5 * 5-day Avg Volume
         is_breaking_out = (close > max_20) & (vol > 1.5 * vol_ma5)
         
-        df['pat_box_breakout'] = (is_consolidating & is_breaking_out).astype(int)
+        result['pat_box_breakout'] = (is_consolidating & is_breaking_out).astype(int)
         
         # 3. 龙头首阴反包 (First Drop Engulfing)
         # T-2: Big surge (> 7%)
@@ -60,7 +63,7 @@ class PatternFactor(BaseFactor):
         yang_t = (close > open_p)
         engulfing_t = (close > high.shift(1))
         
-        df['pat_first_drop_engulf'] = (surge_t2 & yin_t1 & shrink_vol_t1 & yang_t & engulfing_t).astype(int)
+        result['pat_first_drop_engulf'] = (surge_t2 & yin_t1 & shrink_vol_t1 & yang_t & engulfing_t).astype(int)
         
         # 4. 红三兵 (Three White Soldiers)
         # Three consecutive days of Higher Highs, Higher Lows, and Higher Closes (Yang candles)
@@ -74,9 +77,9 @@ class PatternFactor(BaseFactor):
         # Not stretched too far (Total gain in 3 days < 15%)
         not_overbought = (close / pre_close.shift(2) - 1) < 0.15
         
-        df['pat_red_3_soldiers'] = (yang_t2 & yang_t1 & yang_t0 & not_overbought).astype(int)
+        result['pat_red_3_soldiers'] = (yang_t2 & yang_t1 & yang_t0 & not_overbought).astype(int)
         
-        # 5. MACD底背离 (MACD Bullish Divergence - Simplified)
+        # 5. MACD 底背离 (MACD Bullish Divergence - Simplified)
         # Price hits a new 20-day low, but MACD histogram does not hit a new 20-day low.
         # We calculate a simple MACD first
         ema12 = close.ewm(span=12, adjust=False).mean()
@@ -94,6 +97,6 @@ class PatternFactor(BaseFactor):
         # MACD is turning upwards
         macd_turning_up = macd_hist > macd_hist.shift(1)
         
-        df['pat_macd_divergence'] = (price_new_low & macd_not_new_low & macd_turning_up).astype(int)
+        result['pat_macd_divergence'] = (price_new_low & macd_not_new_low & macd_turning_up).astype(int)
         
-        return df
+        return result

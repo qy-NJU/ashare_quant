@@ -15,7 +15,7 @@ pipeline:
       board: "all"        # 跑全市场 A 股
       exchange: "all"     
       exclude_st: true    # 是否剔除 ST/*ST/退市股，过滤垃圾股防雷
-      max_count: 0       # 为了跑得快点，这里限制前 10 只（如果要全市场，设为0，但这会下载很久）
+      max_count: 50       # 为了跑得快点，这里限制前 10 只（如果要全市场，设为0，但这会下载很久）
 
   # 训练加速与数据降噪优化
   training_optimization:
@@ -85,7 +85,7 @@ pipeline:
       objective: "rank:pairwise"
       max_depth: 4
       eta: 0.1
-    num_boost_round: 50           # 训练轮数，可根据数据量调整（数据量大时可减少防止过拟合）
+    num_boost_round: 5           # 训练轮数，可根据数据量调整（数据量大时可减少防止过拟合）
     save_path: "models/saved/config_xgb.json"
 
   # 策略与回测配置
@@ -94,7 +94,7 @@ pipeline:
     params:
       top_k: 2
       rebalance_period: 1
-      use_market_filter: true     # 开启大盘趋势过滤（大盘跌破20日线空仓）
+      use_market_filter: false     # 开启大盘趋势过滤（大盘跌破20日线空仓）
       max_turnover: 0.5           # 每次调仓最多换掉 50% 的仓位
       weight_method: "score"      # 'equal' (等权) 或 'score' (按预测分数加权)
     initial_capital: 100000.0

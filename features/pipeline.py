@@ -50,5 +50,11 @@ class FeaturePipeline:
         # For simple integration, let's keep OHLCV + features
         all_data = pd.concat([df, all_features], axis=1)
         
+        # Drop columns that are all NaN (some factors may not be applicable)
+        all_data = all_data.dropna(axis=1, how='all')
+        
+        # Drop duplicate columns (keep first occurrence)
+        all_data = all_data.loc[:, ~all_data.columns.duplicated()]
+        
         # Usually we want features + labels aligned
         return all_data.dropna() # Drop rows with NaN (due to rolling/shift)

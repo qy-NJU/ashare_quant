@@ -338,8 +338,8 @@ class PipelineRunner:
                 y_batch.append(y)
                 
             if X_batch:
-                X_full = pd.concat(X_batch)
-                y_full = pd.concat(y_batch)
+                X_full = pd.concat(X_batch, ignore_index=True)
+                y_full = pd.concat(y_batch, ignore_index=True)
                 
                 # Ensure X_full has unique columns
                 X_full = X_full.loc[:, ~X_full.columns.duplicated()]

@@ -121,6 +121,11 @@ class DataRepository:
         """
         cache_file = os.path.join(self.daily_k_dir, f"{symbol}.parquet")
 
+        # Fix: 兼容本地文件名没有前缀的情况 (如 "600000.parquet" 而不是 "sh.600000.parquet")
+        if not os.path.exists(cache_file):
+            symbol_only = symbol.replace('sh.', '').replace('sz.', '').replace('bj.', '')
+            cache_file = os.path.join(self.daily_k_dir, f"{symbol_only}.parquet")
+
         if not os.path.exists(cache_file):
             # We don't download on-the-fly anymore. Just return empty DataFrame.
             return pd.DataFrame()

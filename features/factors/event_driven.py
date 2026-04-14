@@ -38,28 +38,30 @@ class EventFactor(BaseFactor):
             self.lhb_df = self.lhb_df.set_index(['symbol', 'date']).sort_index()
 
     def calculate(self, df):
-        # If no LHB data is available or df is empty, return NaN columns
+        # If no LHB data is available or df is empty or 'symbol' not in df.columns, return NaN columns
+        result = pd.DataFrame(index=df.index)
+        
         if self.lhb_df.empty or df.empty or 'symbol' not in df.columns:
-            df['evt_is_lhb'] = 0
-            df['evt_lhb_net_buy_ratio'] = np.nan
-            df['evt_lhb_buy_ratio'] = np.nan
-            return df
+            result['evt_is_lhb'] = 0
+            result['evt_lhb_net_buy_ratio'] = np.nan
+            result['evt_lhb_buy_ratio'] = np.nan
+            return result
             
         symbol = df['symbol'].iloc[0]
         
         # Initialize default values
-        df['evt_is_lhb'] = 0
-        df['evt_lhb_net_buy_ratio'] = np.nan
-        df['evt_lhb_buy_ratio'] = np.nan
+        result['evt_is_lhb'] = 0
+        result['evt_lhb_net_buy_ratio'] = np.nan
+        result['evt_lhb_buy_ratio'] = np.nan
         
         # If this symbol has never been on LHB, just return
         if symbol not in self.lhb_df.index.get_level_values('symbol'):
-            return df
+            return result
             
         # Get LHB events for this specific stock
         stock_lhb = self.lhb_df.loc[symbol]
         
-        # Merge LHB data into the main DataFrame based on date index
+        # Merge LHB data into the result DataFrame based on date index
         # We expect df to have a DatetimeIndex
         
         # 1. Is on LHB today?
@@ -67,7 +69,7 @@ class EventFactor(BaseFactor):
         common_dates = df.index.intersection(stock_lhb.index)
         if len(common_dates) > 0:
             # Set flag to 1 for dates it was on LHB
-            df.loc[common_dates, 'evt_is_lhb'] = 1
+            result.loc[common_dates, 'evt_is_lhb'] = 1
             
             # Calculate Net Buy Ratio (Net Buy / Total Market Turnover of the stock on that day)
             # If '龙虎榜净买额' and '市场总成交额' are available
@@ -79,7 +81,7 @@ class EventFactor(BaseFactor):
                     
                     # Prevent division by zero
                     ratio = np.where(total_turnover > 0, net_buy / total_turnover, 0)
-                    df.loc[common_dates, 'evt_lhb_net_buy_ratio'] = ratio
+                    result.loc[common_dates, 'evt_lhb_net_buy_ratio'] = ratio
                 except Exception as e:
                     pass
                     
@@ -90,8 +92,8 @@ class EventFactor(BaseFactor):
                     total_turnover = pd.to_numeric(stock_lhb.loc[common_dates, '市场总成交额'], errors='coerce')
                     
                     ratio = np.where(total_turnover > 0, buy_amount / total_turnover, 0)
-                    df.loc[common_dates, 'evt_lhb_buy_ratio'] = ratio
+                    result.loc[common_dates, 'evt_lhb_buy_ratio'] = ratio
                 except Exception as e:
                     pass
 
-        return df
+        return result
