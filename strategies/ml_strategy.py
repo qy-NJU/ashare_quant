@@ -11,7 +11,7 @@ def _process_single_stock(args):
     Worker function for parallel stock processing.
     Must be at module level for multiprocessing pickle to work.
     """
-    symbol, date, lookback_days, benchmark_close, dynamic_filter_config, feature_pipeline_config = args
+    symbol, date, lookback_days, benchmark_close, dynamic_filter_config, feature_pipeline_config, cache_dir, cache_enabled, config_hash = args
 
     try:
         # Import here to avoid circular imports and ensure fresh instances in each process
@@ -20,7 +20,24 @@ def _process_single_stock(args):
         from features.pipeline import FeaturePipeline, FACTOR_MAP
 
         # Create fresh instances in this process
-        data_loader = DataRepository()
+        data_loader = DataRepository(cache_dir=cache_dir)
+
+        # Check feature cache first
+        if cache_enabled and config_hash:
+            import hashlib, json
+            cache_subdir = os.path.join(cache_dir, 'features', config_hash)
+            os.makedirs(cache_subdir, exist_ok=True)
+            cache_file = os.path.join(cache_subdir, f"{symbol}_{date}_inference.parquet")
+            if os.path.exists(cache_file):
+                try:
+                    features_df = pd.read_parquet(cache_file)
+                    return {
+                        'symbol': symbol,
+                        'features': features_df.iloc[-1] if len(features_df) > 0 else None,
+                        'from_cache': True
+                    }
+                except:
+                    pass
 
         # Reconstruct dynamic filter
         dynamic_filter = None
@@ -59,13 +76,24 @@ def _process_single_stock(args):
         if features_df.empty:
             return None
 
+        # Save to cache
+        if cache_enabled and config_hash:
+            try:
+                features_df.to_parquet(cache_file, engine='pyarrow')
+            except:
+                pass
+
         # Return the latest row features and symbol
         return {
             'symbol': symbol,
             'features': features_df.iloc[-1]
         }
     except Exception as e:
-        return None
+        # Return error info for debugging
+        return {
+            'symbol': symbol,
+            'error': str(e)
+        }
 
 class MLStrategy(BaseStrategy):
     """
@@ -195,48 +223,50 @@ class MLStrategy(BaseStrategy):
             params = {}
 
             # Known init param names for each factor class
+            # Only pass params if the factor's __init__ actually accepts them
             if class_name == 'PandasTAFactor':
-                params = {'name': factor.name, 'strategy': getattr(factor, 'strategy_mode', 'default'),
+                params = {'strategy': getattr(factor, 'strategy_mode', 'default'),
                          'features': getattr(factor, 'features', None)}
             elif class_name == 'BoardFactor':
-                params = {'name': factor.name, 'encode_method': getattr(factor, 'encode_method', 'category')}
+                params = {'encode_method': getattr(factor, 'encode_method', 'category')}
             elif class_name == 'FinancialFactor':
-                params = {'name': factor.name, 'cache_dir': getattr(factor, 'cache_dir', 'data/cache')}
+                params = {'cache_dir': getattr(factor, 'cache_dir', 'data/cache')}
             elif class_name == 'FundFlowFactor':
-                params = {'name': factor.name, 'cache_dir': getattr(factor, 'cache_dir', 'data/cache')}
+                params = {'cache_dir': getattr(factor, 'cache_dir', 'data/cache')}
             elif class_name == 'MarketFactor':
-                params = {'name': factor.name, 'index_symbol': getattr(factor, 'index_symbol', 'sh.000300')}
-            elif class_name == 'EventFactor':
-                params = {'name': factor.name}
-            elif class_name == 'SubjectiveFactor':
-                params = {'name': factor.name}
-            elif class_name == 'PatternFactor':
-                params = {'name': factor.name}
+                params = {'index_symbol': getattr(factor, 'index_symbol', 'sh.000300')}
             elif class_name == 'LabelGenerator':
                 params = {'horizon': getattr(factor, 'horizon', 5),
                          'target_type': getattr(factor, 'target_type', 'regression')}
             else:
-                # Fallback: use factor's own params attribute if available
-                if hasattr(factor, 'params') and isinstance(factor.params, dict):
-                    params = factor.params
-                elif hasattr(factor, '_params') and isinstance(factor._params, dict):
-                    params = factor._params
+                # EventFactor, SubjectiveFactor, PatternFactor, TechnicalFactors: no params
+                params = {}
 
             # Remove None values to use defaults
             params = {k: v for k, v in params.items() if v is not None}
 
             feature_pipeline_config.append({'class': class_name, 'params': params})
 
+        # Get absolute path for cache_dir to pass to workers
+        cache_dir = getattr(data_loader, 'cache_dir', 'data/local_lake')
+        if not os.path.isabs(cache_dir):
+            cache_dir = os.path.abspath(cache_dir)
+
+        # Compute config hash for feature cache
+        import hashlib, json
+        config_str = json.dumps(feature_pipeline_config, sort_keys=True)
+        config_hash = hashlib.md5(config_str.encode('utf-8')).hexdigest()[:8]
+
         # Use multiprocessing for parallel stock processing
         num_workers = min(mp.cpu_count(), len(candidates), 8)  # Cap at 8 workers
-        filtered_count = {'empty_df': 0, 'len_small': 0, 'dynamic': 0, 'transform': 0, 'exception': 0}
+        filtered_count = {'empty_df': 0, 'len_small': 0, 'dynamic': 0, 'transform': 0, 'exception': 0, 'from_cache': 0}
 
-        # Prepare tasks: (symbol, date, lookback_days, benchmark_close_value, dynamic_filter_config, feature_pipeline_config)
+        # Prepare tasks: (symbol, date, lookback_days, benchmark_close_value, dynamic_filter_config, feature_pipeline_config, cache_dir, cache_enabled, config_hash)
         tasks = []
         for symbol in candidates:
             # Pass a single benchmark close value (latest) for each stock
             bench_close = benchmark_close.iloc[-1] if benchmark_close is not None and len(benchmark_close) > 0 else None
-            tasks.append((symbol, date, lookback_days, bench_close, dynamic_filter_config, feature_pipeline_config))
+            tasks.append((symbol, date, lookback_days, bench_close, dynamic_filter_config, feature_pipeline_config, cache_dir, True, config_hash))
 
         # Parallel execution
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
@@ -247,9 +277,15 @@ class MLStrategy(BaseStrategy):
                 try:
                     result = future.result()
                     if result is None:
-                        # Categorize the failure
+                        filtered_count['exception'] += 1
+                    elif 'error' in result:
+                        # Debug: log the error
+                        if len(filtered_count.get('errors', [])) < 5:
+                            filtered_count.setdefault('errors', []).append(f"{symbol}: {result['error']}")
                         filtered_count['exception'] += 1
                     else:
+                        if result.get('from_cache'):
+                            filtered_count['from_cache'] = filtered_count.get('from_cache', 0) + 1
                         latest_features_list.append(result['features'])
                         valid_symbols.append(result['symbol'])
                 except Exception as e:

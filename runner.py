@@ -29,12 +29,15 @@ from strategies.ml_strategy import MLStrategy
 from backtest.engine import BacktestEngine
 
 
-def _compute_stock_features(args):
+def _compute_stock_features_batch(args):
     """
     Worker function for parallel training feature computation.
+    Processes a BATCH of stocks to amortize FeaturePipeline initialization cost.
     Must be at module level for multiprocessing pickle to work.
     """
-    sym, start, end, include_label, cache_path, dynamic_filter_config, feature_pipeline_config, benchmark_close, enable_filter = args
+    stock_batch, start, end, include_label, dynamic_filter_config, feature_pipeline_config, benchmark_close, enable_filter, cache_dir = args
+
+    results = {}  # sym -> features_df or None
 
     try:
         # Import inside worker to ensure fresh instances
@@ -42,56 +45,53 @@ def _compute_stock_features(args):
         from features.processor import DynamicFilter
         from features.pipeline import FeaturePipeline, FACTOR_MAP
 
-        repo = DataRepository()
+        repo = DataRepository(cache_dir=cache_dir)
         dynamic_filter = DynamicFilter(**dynamic_filter_config) if dynamic_filter_config and enable_filter else None
 
-        # Reconstruct feature pipeline
+        # Reconstruct feature pipeline ONCE per batch (expensive, especially EventFactor loads all LHB data)
         factors = []
         for factor_info in feature_pipeline_config:
             factor_class = FACTOR_MAP[factor_info['class']]
             factors.append(factor_class(**factor_info.get('params', {})))
         feature_pipeline = FeaturePipeline(factors)
 
-        # Check cache first
-        if os.path.exists(cache_path):
+        for sym in stock_batch:
             try:
-                features_df = pd.read_parquet(cache_path)
-                return sym, features_df
-            except:
-                pass
+                # Load raw data
+                df = repo.get_daily_data(sym, start, end)
+                if df.empty:
+                    results[sym] = None
+                    continue
 
-        # Load raw data
-        df = repo.get_daily_data(sym, start, end)
-        if df.empty:
-            return sym, pd.DataFrame()
+                # Apply Dynamic Filter
+                if dynamic_filter:
+                    df = dynamic_filter.filter(df)
+                    if df.empty:
+                        results[sym] = None
+                        continue
 
-        # Apply Dynamic Filter
-        if dynamic_filter:
-            df = dynamic_filter.filter(df)
-            if df.empty:
-                return sym, pd.DataFrame()
+                # Merge benchmark
+                if benchmark_close is not None and not pd.isna(benchmark_close):
+                    df['benchmark_close'] = benchmark_close
 
-        # Merge benchmark
-        if benchmark_close is not None and not pd.isna(benchmark_close):
-            df['benchmark_close'] = benchmark_close
+                # Add symbol column
+                df['symbol'] = sym
 
-        # Add symbol column
-        df['symbol'] = sym
+                # Compute features
+                features_df = feature_pipeline.transform(df)
+                if features_df.empty:
+                    results[sym] = None
+                    continue
 
-        # Compute features
-        features_df = feature_pipeline.transform(df)
-        if features_df.empty:
-            return sym, pd.DataFrame()
+                results[sym] = features_df
+            except Exception as e:
+                results[sym] = None
 
-        # Save to cache
-        try:
-            features_df.to_parquet(cache_path, engine='pyarrow')
-        except:
-            pass
-
-        return sym, features_df
+        return results
     except Exception as e:
-        return sym, pd.DataFrame()
+        # Return empty results on batch-level error
+        print(f"Batch error: {e}")
+        return {sym: None for sym in stock_batch}
 
 class PipelineRunner:
     def __init__(self, config_path):
@@ -160,26 +160,24 @@ class PipelineRunner:
             params = {}
 
             # Known init param names for each factor class
+            # Only pass params if the factor's __init__ actually accepts them
             if class_name == 'PandasTAFactor':
-                params = {'name': factor.name, 'strategy': getattr(factor, 'strategy_mode', 'default'),
+                params = {'strategy': getattr(factor, 'strategy_mode', 'default'),
                          'features': getattr(factor, 'features', None)}
             elif class_name == 'BoardFactor':
-                params = {'name': factor.name, 'encode_method': getattr(factor, 'encode_method', 'category')}
+                params = {'encode_method': getattr(factor, 'encode_method', 'category')}
             elif class_name == 'FinancialFactor':
-                params = {'name': factor.name, 'cache_dir': getattr(factor, 'cache_dir', 'data/cache')}
+                params = {'cache_dir': getattr(factor, 'cache_dir', 'data/cache')}
             elif class_name == 'FundFlowFactor':
-                params = {'name': factor.name, 'cache_dir': getattr(factor, 'cache_dir', 'data/cache')}
+                params = {'cache_dir': getattr(factor, 'cache_dir', 'data/cache')}
             elif class_name == 'MarketFactor':
-                params = {'name': factor.name, 'index_symbol': getattr(factor, 'index_symbol', 'sh.000300')}
-            elif class_name == 'EventFactor':
-                params = {'name': factor.name}
-            elif class_name == 'SubjectiveFactor':
-                params = {'name': factor.name}
-            elif class_name == 'PatternFactor':
-                params = {'name': factor.name}
+                params = {'index_symbol': getattr(factor, 'index_symbol', 'sh.000300')}
             elif class_name == 'LabelGenerator':
                 params = {'horizon': getattr(factor, 'horizon', 5),
                          'target_type': getattr(factor, 'target_type', 'regression')}
+            else:
+                # EventFactor, SubjectiveFactor, PatternFactor, TechnicalFactors: no params
+                params = {}
 
             # Remove None values
             params = {k: v for k, v in params.items() if v is not None}
@@ -389,50 +387,26 @@ class PipelineRunner:
             feature_pipeline_config = self._serialize_feature_pipeline_config(train_pipeline)
             benchmark_close = benchmark_df['close'].iloc[-1] if not benchmark_df.empty else None
 
-            # Prepare tasks: first check cache, only compute if not cached
-            tasks = []
+            # Get absolute path for cache_dir to pass to workers
+            data_cache_dir = self.config['data'].get('cache_dir', 'data/local_lake')
+            if not os.path.isabs(data_cache_dir):
+                data_cache_dir = os.path.abspath(data_cache_dir)
+
+            # Prepare batches: first check cache, only compute if not cached
+            uncached_symbols = []
+            cache_paths = {}
             for sym in symbols:
                 cache_path = self._get_feature_cache_path(sym, start, end, include_label=True)
+                cache_paths[sym] = cache_path
                 if not os.path.exists(cache_path):
-                    tasks.append((sym, start, end, include_label, cache_path,
-                                  dynamic_filter_config, feature_pipeline_config, benchmark_close, enable_filter))
+                    uncached_symbols.append(sym)
 
-            # Parallel feature computation
-            if tasks:
-                num_workers = min(mp.cpu_count(), len(tasks), 8)
-                print(f"Computing features for {len(tasks)} stocks in parallel ({num_workers} workers)...")
-                with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                    futures = {executor.submit(_compute_stock_features, task): task[0] for task in tasks}
-                    for future in as_completed(futures):
-                        sym, features_df = future.result()
-                        if features_df.empty:
-                            continue
-
-                        target_col = [c for c in features_df.columns if c.startswith('target_')]
-                        if not target_col:
-                            continue
-                        target_col = target_col[0]
-
-                        features_df = features_df.dropna(subset=[target_col])
-
-                        # Apply Data Sampling (Random Downsampling)
-                        if sample_rate < 1.0:
-                            features_df = features_df.sample(frac=sample_rate, random_state=42)
-
-                        if features_df.empty:
-                            continue
-
-                        X = features_df.drop(columns=[target_col, 'open', 'high', 'low', 'close', 'volume', 'date', 'symbol'], errors='ignore')
-                        X = X.select_dtypes(include=['number', 'category'])
-                        y = features_df[target_col]
-
-                        X_batch.append(X)
-                        y_batch.append(y)
-
-            # Load cached features for remaining symbols (not in tasks)
-            cached_symbols = [s for s in symbols if s not in [t[0] for t in tasks]]
-            for sym in cached_symbols:
-                cache_path = self._get_feature_cache_path(sym, start, end, include_label=True)
+            # Load cached features first (fast, no multiprocessing needed)
+            cached_count = 0
+            for sym in symbols:
+                if sym in uncached_symbols:
+                    continue
+                cache_path = cache_paths[sym]
                 try:
                     features_df = pd.read_parquet(cache_path)
                     if features_df.empty:
@@ -457,9 +431,62 @@ class PipelineRunner:
 
                     X_batch.append(X)
                     y_batch.append(y)
+                    cached_count += 1
                 except:
-                    continue
-                
+                    # Cache corrupted, treat as uncached
+                    uncached_symbols.append(sym)
+
+            # Parallel feature computation for uncached stocks in batches
+            if uncached_symbols:
+                # Split into batches to amortize FeaturePipeline init cost
+                # Each batch processes multiple stocks with one FeaturePipeline instance
+                num_workers = min(mp.cpu_count(), 8)
+                batch_size = 20  # Small batch size for faster progress feedback
+                batches = [uncached_symbols[i:i+batch_size] for i in range(0, len(uncached_symbols), batch_size)]
+
+                print(f"Computing features for {len(uncached_symbols)} uncached stocks in {len(batches)} batches ({num_workers} workers, ~{batch_size} stocks/batch)...")
+
+                tasks = [(batch, start, end, True, dynamic_filter_config, feature_pipeline_config, benchmark_close, enable_filter, data_cache_dir)
+                         for batch in batches]
+
+                completed_batches = 0
+                with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                    futures = {executor.submit(_compute_stock_features_batch, task): task[0] for task in tasks}
+                    for future in as_completed(futures):
+                        batch_results = future.result()  # dict: sym -> features_df
+                        completed_batches += 1
+                        print(f"  Batch {completed_batches}/{len(batches)} completed, {len([v for v in batch_results.values() if v is not None])} stocks succeeded")
+
+                        for sym, features_df in batch_results.items():
+                            if features_df is None or features_df.empty:
+                                continue
+
+                            # Save to cache
+                            try:
+                                features_df.to_parquet(cache_paths[sym], engine='pyarrow')
+                            except:
+                                pass
+
+                            target_col = [c for c in features_df.columns if c.startswith('target_')]
+                            if not target_col:
+                                continue
+                            target_col = target_col[0]
+
+                            features_df = features_df.dropna(subset=[target_col])
+
+                            if sample_rate < 1.0:
+                                features_df = features_df.sample(frac=sample_rate, random_state=42)
+
+                            if features_df.empty:
+                                continue
+
+                            X = features_df.drop(columns=[target_col, 'open', 'high', 'low', 'close', 'volume', 'date', 'symbol'], errors='ignore')
+                            X = X.select_dtypes(include=['number', 'category'])
+                            y = features_df[target_col]
+
+                            X_batch.append(X)
+                            y_batch.append(y)
+
             if X_batch:
                 # Keep original index (dates) for proper groupby in ranking
                 X_full = pd.concat(X_batch)
