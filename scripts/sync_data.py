@@ -179,7 +179,8 @@ def sync_lhb_data(start_date='20200101', end_date=None):
         try:
             local_df = pd.read_parquet(save_path)
             if not local_df.empty:
-                last_date = pd.to_datetime(local_df['上榜日期']).max().strftime('%Y%m%d')
+                date_col = '上榜日' if '上榜日' in local_df.columns else '上榜日期'
+                last_date = pd.to_datetime(local_df[date_col]).max().strftime('%Y%m%d')
                 if last_date >= end_date:
                     print("LHB data is already up to date.")
                     return
@@ -197,8 +198,9 @@ def sync_lhb_data(start_date='20200101', end_date=None):
         if not new_df.empty:
             if not local_df.empty:
                 combined_df = pd.concat([local_df, new_df])
-                combined_df = combined_df.drop_duplicates(subset=['上榜日期', '代码'], keep='last')
-                combined_df = combined_df.sort_values('上榜日期')
+                date_col_combined = '上榜日' if '上榜日' in combined_df.columns else '上榜日期'
+                combined_df = combined_df.drop_duplicates(subset=[date_col_combined, '代码'], keep='last')
+                combined_df = combined_df.sort_values(date_col_combined)
             else:
                 combined_df = new_df
                 
