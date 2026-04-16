@@ -15,10 +15,29 @@ LOCAL_LAKE_DIR = 'data/local_lake'
 DAILY_K_DIR = os.path.join(LOCAL_LAKE_DIR, 'daily_k')
 BASICS_DIR = os.path.join(LOCAL_LAKE_DIR, 'basics')
 EVENTS_DIR = os.path.join(LOCAL_LAKE_DIR, 'events')
+FINANCIALS_DIR = os.path.join(LOCAL_LAKE_DIR, 'financials')
+FUNDS_DIR = os.path.join(LOCAL_LAKE_DIR, 'funds')
 
 os.makedirs(DAILY_K_DIR, exist_ok=True)
 os.makedirs(BASICS_DIR, exist_ok=True)
 os.makedirs(EVENTS_DIR, exist_ok=True)
+os.makedirs(FINANCIALS_DIR, exist_ok=True)
+os.makedirs(FUNDS_DIR, exist_ok=True)
+
+def sync_fund_flow_for_symbol(symbol):
+    cache_file = os.path.join(FUNDS_DIR, f"fund_{symbol}.parquet")
+    if os.path.exists(cache_file):
+        return
+    try:
+        df = ak.stock_individual_fund_flow(symbol="sh600000", market="sh") # This is just an example, akshare is complicated
+        # Actually AkShareSource has a get_fund_flow method
+        from data.source.akshare_source import AkShareSource
+        source = AkShareSource()
+        df = source.get_fund_flow(symbol)
+        if not df.empty:
+            df.to_parquet(cache_file, engine='pyarrow', index=True)
+    except Exception as e:
+        pass
 
 def sync_stock_list(source):
     print("Syncing A-share stock list...")
@@ -31,6 +50,60 @@ def sync_stock_list(source):
     df.to_parquet(save_path, engine='pyarrow', index=False)
     print(f"Stock list saved to {save_path} ({len(df)} stocks)")
     return df
+
+def sync_industry_mapping():
+    print("Syncing Industry Classification from Baostock...")
+    import baostock as bs
+    lg = bs.login()
+    if lg.error_code != '0':
+        print("Baostock login failed for industry mapping.")
+        return
+        
+    rs = bs.query_stock_industry()
+    industry_data = []
+    while (rs.error_code == '0') & rs.next():
+        industry_data.append(rs.get_row_data())
+        
+    bs.logout()
+    if industry_data:
+        df = pd.DataFrame(industry_data, columns=rs.fields)
+        df['symbol'] = df['code'].apply(lambda x: x.split('.')[1] if '.' in x else x)
+        save_path = os.path.join(BASICS_DIR, 'industry_map.parquet')
+        df[['symbol', 'industry']].to_parquet(save_path, engine='pyarrow', index=False)
+        print(f"Industry mapping saved to {save_path} ({len(df)} records)")
+    else:
+        print("No industry data found.")
+
+def sync_financial_data_for_symbol(source, symbol, start_year=2015, end_year=None):
+    if end_year is None:
+        end_year = datetime.datetime.now().year
+
+    for year in range(start_year, end_year + 1):
+        for quarter in range(1, 5):
+            # Check if this quarter is in the future
+            if year == datetime.datetime.now().year and quarter > (datetime.datetime.now().month - 1) // 3 + 1:
+                continue
+                
+            cache_file = os.path.join(FINANCIALS_DIR, f"fin_{symbol}_{year}_{quarter}.parquet")
+            if os.path.exists(cache_file):
+                continue
+                
+            df_profit = source.get_profit_data(symbol, year, quarter)
+            df_growth = source.get_growth_data(symbol, year, quarter)
+            
+            if df_profit.empty and df_growth.empty:
+                continue
+                
+            if df_profit.empty:
+                df_merged = df_growth
+            elif df_growth.empty:
+                df_merged = df_profit
+            else:
+                common_cols = list(set(df_profit.columns) & set(df_growth.columns))
+                df_merged = pd.merge(df_profit, df_growth, on=common_cols, how='outer')
+                
+            if not df_merged.empty:
+                df_merged.to_parquet(cache_file, engine='pyarrow', index=False)
 
 def sync_daily_data_for_symbol(source, symbol, start_date='2015-01-01', end_date=None):
     if end_date is None:
@@ -144,6 +217,9 @@ def sync_all_daily_data(symbols_limit=None, start_date='2020-01-01'):
     if stock_df.empty:
         return
         
+    # 2. Sync Industry Mapping
+    sync_industry_mapping()
+        
     symbols = stock_df['symbol'].tolist()
     
     # For index
@@ -164,6 +240,13 @@ def sync_all_daily_data(symbols_limit=None, start_date='2020-01-01'):
             print(f"Progress: {count}/{len(symbols)}...")
             
         sync_daily_data_for_symbol(source, sym, start_date=start_date, end_date=end_date)
+        
+        # Also sync financial data
+        start_year = int(start_date.split('-')[0])
+        sync_financial_data_for_symbol(source, sym, start_year=start_year, end_year=int(end_date.split('-')[0]))
+        
+        # Also sync fund flow data
+        sync_fund_flow_for_symbol(sym)
         
         # Simple rate limiting for Baostock
         if count % 50 == 0:

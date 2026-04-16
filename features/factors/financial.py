@@ -1,52 +1,20 @@
 from .base_factor import BaseFactor
 import pandas as pd
 import numpy as np
-from data.source.baostock_source import BaostockSource
+from data.repository import DataRepository
 import os
 
 class FinancialFactor(BaseFactor):
     """
     Fetches and aligns quarterly financial data to daily price data.
     """
-    def __init__(self, name="FinancialFactor", cache_dir='data/cache'):
+    def __init__(self, name="FinancialFactor", cache_dir='data/local_lake'):
         super().__init__(name)
-        self.source = BaostockSource()
-        self.cache_dir = cache_dir
-        if not os.path.exists(cache_dir):
-            os.makedirs(cache_dir)
+        self.repo = DataRepository(cache_dir=cache_dir)
             
     def _fetch_quarterly_data(self, symbol, year, quarter):
-        # We need a caching mechanism here because fetching per day is inefficient
-        # Cache key: symbol_year_quarter
-        cache_file = os.path.join(self.cache_dir, f"fin_{symbol}_{year}_{quarter}.parquet")
-        
-        if os.path.exists(cache_file):
-            return pd.read_parquet(cache_file)
-            
-        # Fetch from source
-        # 1. Profit
-        df_profit = self.source.get_profit_data(symbol, year, quarter)
-        # 2. Growth
-        df_growth = self.source.get_growth_data(symbol, year, quarter)
-        
-        # Merge if both exist
-        if df_profit.empty and df_growth.empty:
-            return pd.DataFrame()
-        
-        if df_profit.empty:
-            df_merged = df_growth
-        elif df_growth.empty:
-            df_merged = df_profit
-        else:
-            # Both have 'code', 'pubDate', 'statDate'
-            # We merge on common columns
-            common_cols = list(set(df_profit.columns) & set(df_growth.columns))
-            df_merged = pd.merge(df_profit, df_growth, on=common_cols, how='outer')
-            
-        if not df_merged.empty:
-            df_merged.to_parquet(cache_file)
-            
-        return df_merged
+        # Read from local repository
+        return self.repo.get_financial_data(symbol, year, quarter)
 
     def calculate(self, df):
         if 'symbol' not in df.columns:

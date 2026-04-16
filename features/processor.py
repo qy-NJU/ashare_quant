@@ -161,10 +161,17 @@ class CrossSectionalProcessor:
             if not pd.api.types.is_numeric_dtype(processed_df[col]):
                 continue
                 
+            # Store original dtype for restoration after transform
+            original_dtype = processed_df[col].dtype
+
             # 1. MAD Clipping
             if self.use_mad_clip:
-                processed_df[col] = processed_df.groupby(level=0)[col].transform(self._mad_clip)
-                
+                result = processed_df.groupby(level=0)[col].transform(self._mad_clip)
+                # Restore numeric dtype if transform changed it to object
+                if not pd.api.types.is_numeric_dtype(result.dtype):
+                    result = pd.to_numeric(result, errors='coerce')
+                processed_df[col] = result
+
             # 2. Z-Score Normalization
             # Skip Z-Score for columns with near-zero variance within any group
             # (these features have no cross-sectional discrimination power)
@@ -172,9 +179,17 @@ class CrossSectionalProcessor:
                 group_stds = processed_df.groupby(level=0)[col].std()
                 # Only apply Z-Score if std > 1e-8 for at least one group
                 if group_stds.max() > 1e-8:
-                    processed_df[col] = processed_df.groupby(level=0)[col].transform(self._zscore)
+                    result = processed_df.groupby(level=0)[col].transform(self._zscore)
+                    # Restore numeric dtype if transform changed it to object
+                    if not pd.api.types.is_numeric_dtype(result.dtype):
+                        result = pd.to_numeric(result, errors='coerce')
+                    processed_df[col] = result
                 else:
                     # Set to 0 to indicate no discrimination power
                     processed_df[col] = 0.0
+
+            # Ensure final dtype is numeric
+            if not pd.api.types.is_numeric_dtype(processed_df[col].dtype):
+                processed_df[col] = pd.to_numeric(processed_df[col], errors='coerce')
 
         return processed_df

@@ -1,18 +1,15 @@
 from .base_factor import BaseFactor
 import pandas as pd
-from data.source.akshare_source import AkShareSource
+from data.repository import DataRepository
 import os
 
 class FundFlowFactor(BaseFactor):
     """
     Fetches daily individual fund flow data (Main/Super/Large/Medium/Small orders).
     """
-    def __init__(self, name="FundFlowFactor", cache_dir='data/cache'):
+    def __init__(self, name="FundFlowFactor", cache_dir='data/local_lake'):
         super().__init__(name)
-        self.source = AkShareSource()
-        self.cache_dir = cache_dir
-        if not os.path.exists(cache_dir):
-            os.makedirs(cache_dir)
+        self.repo = DataRepository(cache_dir=cache_dir)
 
     def calculate(self, df):
         if 'symbol' not in df.columns:
@@ -21,18 +18,7 @@ class FundFlowFactor(BaseFactor):
             
         symbol = df['symbol'].iloc[0]
         
-        # Cache mechanism
-        cache_file = os.path.join(self.cache_dir, f"fund_{symbol}.parquet")
-        
-        if os.path.exists(cache_file):
-            try:
-                fund_df = pd.read_parquet(cache_file)
-            except:
-                fund_df = pd.DataFrame()
-        else:
-            fund_df = self.source.get_fund_flow(symbol)
-            if not fund_df.empty:
-                fund_df.to_parquet(cache_file)
+        fund_df = self.repo.get_fund_flow(symbol)
         
         if fund_df.empty:
             return pd.DataFrame(index=df.index)

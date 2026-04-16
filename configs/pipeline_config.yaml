@@ -2,6 +2,7 @@
 
 pipeline:
   name: "V4_Config_Driven_Pipeline"
+  mode: "backtest_only"  # 可选: "train" (训练+回测), "backtest_only" (仅回测), "inference" (单日预测)
   
   # 数据源配置
   data:
@@ -85,7 +86,7 @@ pipeline:
       objective: "rank:pairwise"
       max_depth: 4
       eta: 0.1
-    num_boost_round: 5           # 训练轮数，可根据数据量调整（数据量大时可减少防止过拟合）
+    num_boost_round: 50           # 训练轮数，可根据数据量调整（数据量大时可减少防止过拟合）
     save_path: "models/saved/config_xgb.json"
 
   # 策略与回测配置

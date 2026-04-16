@@ -8,9 +8,6 @@ import multiprocessing as mp
 
 # Import all possible components to make them available for eval/getattr
 from data.repository import DataRepository
-from data.source.baostock_source import BaostockSource
-from data.source.mock_source import MockDataSource
-from data.source.akshare_source import AkShareSource
 from data.pool_manager import StockPoolManager
 from features.pipeline import FeaturePipeline
 from features.factors.pandas_ta_factor import PandasTAFactor
@@ -167,9 +164,9 @@ class PipelineRunner:
             elif class_name == 'BoardFactor':
                 params = {'encode_method': getattr(factor, 'encode_method', 'category')}
             elif class_name == 'FinancialFactor':
-                params = {'cache_dir': getattr(factor, 'cache_dir', 'data/cache')}
+                params = {'cache_dir': getattr(factor.repo, 'cache_dir', 'data/local_lake')}
             elif class_name == 'FundFlowFactor':
-                params = {'cache_dir': getattr(factor, 'cache_dir', 'data/cache')}
+                params = {'cache_dir': getattr(factor.repo, 'cache_dir', 'data/local_lake')}
             elif class_name == 'MarketFactor':
                 params = {'index_symbol': getattr(factor, 'index_symbol', 'sh.000300')}
             elif class_name == 'LabelGenerator':
@@ -255,7 +252,7 @@ class PipelineRunner:
                 print(f"Error: load_path {load_path} not found for inference.")
                 return
             model.load(load_path)
-            
+
             # Prepare data for TODAY (or latest available)
             # We need enough history to calculate features (e.g. 30-60 days)
             # Note: Since Baostock free data might not have 2026 data, we mock 'today' as 2023-06-01 for demo
@@ -273,52 +270,50 @@ class PipelineRunner:
             # For excess return or ranking, we might need a benchmark
             # Let's fetch benchmark data once per window (sh.000300 is HS300 in Baostock)
             benchmark_df = repo.get_daily_data("sh.000300", start_date_str, end_date_str)
+            benchmark_close = benchmark_df['close'].iloc[-1] if not benchmark_df.empty else None
             
             # --- Apply Cross-Sectional Processing on Predictions (if needed) ---
-            # Wait, prediction features should be cross-sectionally processed!
-            # Since we predict stock by stock above, cross-sectional features for the latest day are NOT calculated correctly.
-            # We must gather all latest features, process them together, then predict.
             print("Gathering features for all symbols to apply cross-sectional processing...")
             
+            # Use multiprocessing for feature computation in inference mode
+            num_workers = min(mp.cpu_count(), 8)
+            batch_size = 50
+            batches = [symbols[i:i+batch_size] for i in range(0, len(symbols), batch_size)]
+            
+            dynamic_filter_config = None
+            if enable_filter and dynamic_filter:
+                dynamic_filter_config = {
+                    'min_avg_turnover': dynamic_filter.min_avg_turnover,
+                    'min_listed_days': dynamic_filter.min_listed_days
+                }
+            feature_pipeline_config = self._serialize_feature_pipeline_config(infer_pipeline)
+            data_cache_dir = self.config['data'].get('cache_dir', 'data/local_lake')
+            if not os.path.isabs(data_cache_dir):
+                data_cache_dir = os.path.abspath(data_cache_dir)
+                
+            tasks = [(batch, start_date_str, end_date_str, False, dynamic_filter_config, feature_pipeline_config, benchmark_close, enable_filter, data_cache_dir)
+                     for batch in batches]
+                     
             latest_features_list = []
             valid_symbols = []
             
-            count = 0
-            for sym in symbols:
-                count += 1
-                if count % 100 == 0:
-                    print(f"Processing {count}/{len(symbols)}...")
+            print(f"Computing features for {len(symbols)} stocks in {len(batches)} batches ({num_workers} workers)...")
+            completed_batches = 0
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                futures = {executor.submit(_compute_stock_features_batch, task): task[0] for task in tasks}
+                for future in as_completed(futures):
+                    batch_results = future.result()  # dict: sym -> features_df
+                    completed_batches += 1
+                    print(f"  Batch {completed_batches}/{len(batches)} completed")
                     
-                # Fetch data
-                df = repo.get_daily_data(sym, start_date_str, end_date_str)
-                if df.empty or len(df) < 30: continue
-                
-                # Apply Dynamic Filter (Zombie stocks, New stocks)
-                if enable_filter:
-                    df = dynamic_filter.filter(df)
-                    if df.empty: continue
-                
-                # Merge benchmark
-                if not benchmark_df.empty:
-                    try:
-                        df = df.join(benchmark_df['close'].rename('benchmark_close'), how='left')
-                    except:
-                        pass
+                    for sym, features_df in batch_results.items():
+                        if features_df is None or features_df.empty:
+                            continue
                         
-                # Add symbol column
-                df['symbol'] = sym
-                
-                # Transform
-                try:
-                    features_df = infer_pipeline.transform(df)
-                    if features_df.empty: continue
-                    
-                    # Take the LATEST row for prediction
-                    latest_features = features_df.iloc[[-1]]
-                    latest_features_list.append(latest_features)
-                    valid_symbols.append(sym)
-                except Exception as e:
-                    pass
+                        # Take the LATEST row for prediction
+                        latest_features = features_df.iloc[[-1]]
+                        latest_features_list.append(latest_features)
+                        valid_symbols.append(sym)
             
             if not latest_features_list:
                 print("No features generated.")
@@ -352,6 +347,50 @@ class PipelineRunner:
             out_file = f"data/predictions/pred_{end_date_str}.csv"
             pred_df.to_csv(out_file, index=False)
             print(f"\nFull predictions saved to {out_file}")
+            return
+
+        # --- BACKTEST ONLY MODE (skip training, use saved model) ---
+        elif mode == 'backtest_only':
+            print("\n=== RUNNING BACKTEST ONLY MODE (skipping training) ===")
+            # Load saved model
+            load_path = self.config['model'].get('save_path')
+            if not load_path or not os.path.exists(load_path):
+                print(f"Error: saved model {load_path} not found. Please train first.")
+                return
+            model.load(load_path)
+            print(f"Loaded saved model from {load_path}")
+
+            # Skip training, go directly to backtest
+            # Build inference pipeline for backtest
+            infer_pipeline = self.build_feature_pipeline(include_label=False)
+
+            # Get backtest period
+            b_start = self.config['windows'].get('backtest', {}).get('start', '').replace('-', '')
+            b_end = self.config['windows'].get('backtest', {}).get('end', '').replace('-', '')
+            if not b_start or not b_end:
+                print("Error: backtest start/end not configured.")
+                return
+
+            print(f"\n--- Backtest Phase: {b_start} to {b_end} ---")
+            print("Starting backtest from {} to {} with {} capital.".format(
+                b_start, b_end, self.config['strategy'].get('initial_capital', 100000.0)))
+
+            # Build Strategy with saved model
+            strat_cfg = self.config['strategy']
+            strat_params = strat_cfg.get('params', {})
+
+            if strat_cfg['name'] == 'MLStrategy':
+                strategy = MLStrategy(name="YAML_Strategy", model=model, feature_pipeline=infer_pipeline, universe=symbols,
+                                      processor=processor, dynamic_filter=dynamic_filter, **strat_params)
+            else:
+                strategy = self._instantiate_class(strat_cfg['name'], strat_params)
+
+            # Run Engine
+            engine = BacktestEngine(strategy, repo, initial_capital=strat_cfg.get('initial_capital', 100000.0))
+            results = engine.run(b_start, b_end)
+
+            print("\nPipeline Execution Completed. Final Results:")
+            print(results.tail())
             return
 
         # --- TRAIN/BACKTEST MODE ---

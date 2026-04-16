@@ -30,6 +30,8 @@ class DataRepository:
         self.daily_k_dir = os.path.join(self.cache_dir, 'daily_k')
         self.basics_dir = os.path.join(self.cache_dir, 'basics')
         self.events_dir = os.path.join(self.cache_dir, 'events')
+        self.financials_dir = os.path.join(self.cache_dir, 'financials')
+        self.funds_dir = os.path.join(self.cache_dir, 'funds')
 
         if not os.path.exists(self.daily_k_dir):
             print(f"Warning: Local Data Lake directory '{self.daily_k_dir}' does not exist.")
@@ -53,6 +55,66 @@ class DataRepository:
 
         print(f"Stock list not found at {cache_file}.")
         print("Please run `python scripts/sync_data.py` to sync basic data.")
+        return pd.DataFrame()
+
+    def get_industry_mapping(self):
+        """
+        Load industry classification mapping from local Data Lake.
+        
+        Returns:
+            dict: Mapping of symbol to industry name. Returns empty dict if not found.
+        """
+        cache_file = os.path.join(self.basics_dir, 'industry_map.parquet')
+        
+        if os.path.exists(cache_file):
+            try:
+                df = pd.read_parquet(cache_file)
+                return dict(zip(df['symbol'], df['industry']))
+            except Exception as e:
+                print(f"Error reading local industry mapping: {e}")
+                
+        return {}
+
+    def get_financial_data(self, symbol, year, quarter):
+        """
+        Load quarterly financial data (profit/growth merged) from local Data Lake.
+        
+        Args:
+            symbol (str): Stock symbol
+            year (int): Year
+            quarter (int): Quarter (1-4)
+            
+        Returns:
+            pd.DataFrame: Merged financial data. Empty if not found.
+        """
+        cache_file = os.path.join(self.financials_dir, f"fin_{symbol}_{year}_{quarter}.parquet")
+        
+        if os.path.exists(cache_file):
+            try:
+                return pd.read_parquet(cache_file)
+            except Exception as e:
+                print(f"Error reading local financial data: {e}")
+                
+        return pd.DataFrame()
+
+    def get_fund_flow(self, symbol):
+        """
+        Load daily fund flow data for a stock from local Data Lake.
+        
+        Args:
+            symbol (str): Stock symbol
+            
+        Returns:
+            pd.DataFrame: Fund flow data. Empty if not found.
+        """
+        cache_file = os.path.join(self.funds_dir, f"fund_{symbol}.parquet")
+        
+        if os.path.exists(cache_file):
+            try:
+                return pd.read_parquet(cache_file)
+            except Exception as e:
+                print(f"Error reading local fund flow data: {e}")
+                
         return pd.DataFrame()
 
     def get_lhb_data(self, start_date=None, end_date=None):

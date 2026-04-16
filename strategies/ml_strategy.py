@@ -11,7 +11,7 @@ def _process_single_stock(args):
     Worker function for parallel stock processing.
     Must be at module level for multiprocessing pickle to work.
     """
-    symbol, date, lookback_days, benchmark_close, dynamic_filter_config, feature_pipeline_config, cache_dir, cache_enabled, config_hash = args
+    symbol, date, lookback_days, benchmark_df_dict, benchmark_index, dynamic_filter_config, feature_pipeline_config, cache_dir, cache_enabled, config_hash = args
 
     try:
         # Import here to avoid circular imports and ensure fresh instances in each process
@@ -39,6 +39,17 @@ def _process_single_stock(args):
                 except:
                     pass
 
+        # Reconstruct benchmark DataFrame for MarketFactor
+        benchmark_df_worker = None
+        if benchmark_df_dict is not None and benchmark_index is not None:
+            benchmark_df_worker = pd.DataFrame(benchmark_df_dict, index=pd.DatetimeIndex(benchmark_index))
+            # Pre-compute index features
+            benchmark_df_worker['idx_ret'] = benchmark_df_worker['close'].pct_change()
+            benchmark_df_worker['idx_ma20'] = benchmark_df_worker['close'].rolling(20).mean()
+            benchmark_df_worker['idx_trend'] = (benchmark_df_worker['close'] / benchmark_df_worker['idx_ma20']) - 1
+            benchmark_df_worker['idx_vol20'] = benchmark_df_worker['idx_ret'].rolling(20).std()
+            benchmark_df_worker = benchmark_df_worker[['close', 'idx_ret', 'idx_trend', 'idx_vol20']]
+
         # Reconstruct dynamic filter
         dynamic_filter = None
         if dynamic_filter_config:
@@ -48,7 +59,13 @@ def _process_single_stock(args):
         factors = []
         for factor_info in feature_pipeline_config:
             factor_class = FACTOR_MAP[factor_info['class']]
-            factors.append(factor_class(**factor_info.get('params', {})))
+            factor_instance = factor_class(**factor_info.get('params', {}))
+
+            # Special handling for MarketFactor: set up pre-computed index data
+            if factor_info['class'] == 'MarketFactor' and benchmark_df_worker is not None:
+                factor_instance.index_df = benchmark_df_worker
+
+            factors.append(factor_instance)
         feature_pipeline = FeaturePipeline(factors)
 
         # Fetch data
@@ -64,9 +81,12 @@ def _process_single_stock(args):
             if df.empty:
                 return None
 
-        # Merge benchmark
-        if benchmark_close is not None and not pd.isna(benchmark_close):
-            df['benchmark_close'] = benchmark_close
+        # Merge benchmark: compute latest close from benchmark_df_dict for PandasTAFactor
+        if benchmark_df_dict is not None:
+            benchmark_df_worker = pd.DataFrame(benchmark_df_dict)
+            if not benchmark_df_worker.empty and 'close' in benchmark_df_worker.columns:
+                bench_close_value = benchmark_df_worker['close'].iloc[-1]
+                df['benchmark_close'] = bench_close_value
 
         # Inject symbol
         df['symbol'] = symbol
@@ -261,12 +281,15 @@ class MLStrategy(BaseStrategy):
         num_workers = min(mp.cpu_count(), len(candidates), 8)  # Cap at 8 workers
         filtered_count = {'empty_df': 0, 'len_small': 0, 'dynamic': 0, 'transform': 0, 'exception': 0, 'from_cache': 0}
 
-        # Prepare tasks: (symbol, date, lookback_days, benchmark_close_value, dynamic_filter_config, feature_pipeline_config, cache_dir, cache_enabled, config_hash)
+        # Convert benchmark_df to dict for pickling (DataFrame can't be pickled directly)
+        # Use 'list' orientation to get {col: [values]}, then reconstruct with index
+        benchmark_df_dict = benchmark_df.to_dict('list') if not benchmark_df.empty else None
+        benchmark_index = benchmark_df.index.tolist() if not benchmark_df.empty else None
+
+        # Prepare tasks: (symbol, date, lookback_days, benchmark_df_dict, benchmark_index, dynamic_filter_config, feature_pipeline_config, cache_dir, cache_enabled, config_hash)
         tasks = []
         for symbol in candidates:
-            # Pass a single benchmark close value (latest) for each stock
-            bench_close = benchmark_close.iloc[-1] if benchmark_close is not None and len(benchmark_close) > 0 else None
-            tasks.append((symbol, date, lookback_days, bench_close, dynamic_filter_config, feature_pipeline_config, cache_dir, True, config_hash))
+            tasks.append((symbol, date, lookback_days, benchmark_df_dict, benchmark_index, dynamic_filter_config, feature_pipeline_config, cache_dir, True, config_hash))
 
         # Parallel execution
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
@@ -297,7 +320,7 @@ class MLStrategy(BaseStrategy):
         # Debug: check feature names from first successful symbol
         if latest_features_list:
             sample_features = latest_features_list[0]
-            print(f"[DEBUG {date}] Sample features ({len(sample_features.columns)} cols): {list(sample_features.columns)[:15]}...")
+            print(f"[DEBUG {date}] Sample features ({len(sample_features)} cols): {list(sample_features.index)[:15]}...")
 
         # Debug: count how far we got
         print(f"[DEBUG {date}] After parallel processing: valid_symbols={len(valid_symbols)} out of {len(candidates)}")
@@ -309,8 +332,19 @@ class MLStrategy(BaseStrategy):
                 print(f"[DEBUG] DynamicFilter: min_listed_days={self.dynamic_filter.min_listed_days}, min_turnover={self.dynamic_filter.min_avg_turnover}")
             return []
 
-        # Form Cross-Section
-        X_full = pd.concat(latest_features_list)
+        # Form Cross-Section (each item is a Series, need to convert to single-row DataFrame)
+        X_full = pd.concat([s.to_frame().T for s in latest_features_list])
+
+        # Fix: When Series has mixed types (including string columns like board_industry),
+        # the entire Series becomes object dtype. After concat, ALL columns become object.
+        # Convert numeric columns back to proper numeric types.
+        for col in X_full.columns:
+            if X_full[col].dtype == 'object':
+                # Try to convert to numeric
+                converted = pd.to_numeric(X_full[col], errors='coerce')
+                # Only keep if conversion worked (no NaN from coercion)
+                if not converted.isna().all():
+                    X_full[col] = converted
 
         # Apply Cross-Sectional Processor (MAD Clip & Z-Score)
         if self.processor:
@@ -320,8 +354,15 @@ class MLStrategy(BaseStrategy):
         # Drop non-feature columns before prediction
         # Also drop string/object columns that XGBoost cannot handle
         X_pred = X_full.drop(columns=['open', 'high', 'low', 'close', 'volume', 'date', 'symbol'], errors='ignore')
+
+        # DEBUG: check columns before select_dtypes
+        print(f"[DEBUG {date}] Before select_dtypes - columns: {list(X_pred.columns)}, dtypes: {dict(X_pred.dtypes.value_counts())}")
+
         # Keep only numeric and category columns (XGBoost supports these with enable_categorical=True)
         X_pred = X_pred.select_dtypes(include=['number', 'category'])
+
+        # DEBUG: trace X_pred columns
+        print(f"[DEBUG {date}] X_pred shape: {X_pred.shape}, X_pred columns: {list(X_pred.columns)[:10]}...")
 
         # Batch Predict
         try:
