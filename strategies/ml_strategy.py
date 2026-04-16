@@ -250,9 +250,9 @@ class MLStrategy(BaseStrategy):
             elif class_name == 'BoardFactor':
                 params = {'encode_method': getattr(factor, 'encode_method', 'category')}
             elif class_name == 'FinancialFactor':
-                params = {'cache_dir': getattr(factor, 'cache_dir', 'data/cache')}
+                params = {'cache_dir': getattr(factor.repo, 'cache_dir', 'data/local_lake')}
             elif class_name == 'FundFlowFactor':
-                params = {'cache_dir': getattr(factor, 'cache_dir', 'data/cache')}
+                params = {'cache_dir': getattr(factor.repo, 'cache_dir', 'data/local_lake')}
             elif class_name == 'MarketFactor':
                 params = {'index_symbol': getattr(factor, 'index_symbol', 'sh.000300')}
             elif class_name == 'LabelGenerator':

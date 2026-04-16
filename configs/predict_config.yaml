@@ -8,7 +8,7 @@ pipeline:
   data:
     sources:
       - "AkShareSource"
-    cache_dir: "data/cache"
+    cache_dir: "data/local_lake"
     pool:
       board: "main"
       exchange: "sh"
