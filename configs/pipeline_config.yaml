@@ -2,7 +2,7 @@
 
 pipeline:
   name: "V4_Config_Driven_Pipeline"
-  mode: "backtest_only"  # 可选: "train" (训练+回测), "backtest_only" (仅回测), "inference" (单日预测)
+  mode: "backtest_only"  # 重新训练模型，因为我们修改了 Label 的 horizon
   
   # 数据源配置
   data:
@@ -64,11 +64,10 @@ pipeline:
       params: {}
     - name: "PandasTAFactor"
       params: 
-        strategy: "custom"
-        features: ['BBU_5_2.0_2.0', 'BBL_5_2.0_2.0', 'fin_net_profit', 'MACDs_12_26_9', 'MACD_12_26_9', 'main_net_inflow', 'fin_yoy_ni', 'D_9_3', 'MACDh_12_26_9', 'BBM_5_2.0_2.0', 'J_9_3', 'BBB_5_2.0_2.0', 'ATRr_14', 'SMA_10', 'main_net_ratio', 'fin_roe', 'RSI_14', 'OBV', 'BBP_5_2.0_2.0', 'super_net_ratio', 'K_9_3', 'benchmark_close']
+        strategy: "all"
     - name: "LabelGenerator"
       params: 
-        horizon: 3  # 预测未来3日收益率
+        horizon: 15  # 预测未来15日收益率，让模型学习走趋势的“慢牛股”
         # 目标类型可选:
         # 'regression' : 预测具体的收益率数值 (对应 model objective: reg:squarederror)
         # 'binary' : 预测涨跌 (只输出1和0，对应 model objective: binary:logistic)
@@ -84,18 +83,24 @@ pipeline:
       # 如果 target_type 是 excess_return_binary，可以使用 binary:logistic
       # 如果 target_type 是 rank_pct，强烈建议使用 'rank:pairwise'
       objective: "rank:pairwise"
-      max_depth: 4
-      eta: 0.1
-    num_boost_round: 50           # 训练轮数，可根据数据量调整（数据量大时可减少防止过拟合）
+      max_depth: 3                # 降低树深度，防止过拟合 (原为4)
+      eta: 0.05                   # 降低学习率，让模型学习更平缓 (原为0.1)
+      subsample: 0.8              # 增加行采样，增加随机性防过拟合
+      colsample_bytree: 0.8       # 增加列采样，增加随机性防过拟合
+      min_child_weight: 5         # 叶子节点最小权重，防止过度切分
+      lambda: 1.0                 # L2 正则化
+      alpha: 0.5                  # L1 正则化
+    num_boost_round: 100          # 学习率降低后，适当增加训练轮数以保证收敛
     save_path: "models/saved/config_xgb.json"
 
   # 策略与回测配置
   strategy:
     name: "MLStrategy"
     params:
-      top_k: 2
-      rebalance_period: 1
-      use_market_filter: false     # 开启大盘趋势过滤（大盘跌破20日线空仓）
+      top_k: 4                    # 持股 4 只，方便波段调仓
+      target_position_ratio: 0.6  # 总仓位控制在 6 成，留出现金做缓冲
+      rebalance_period: 3         # 调仓周期改为 3 天，降低交易摩擦成本，给股票时间跑出收益
+      use_market_filter: false    # 关闭大盘趋势过滤，在 6 成仓位下保持策略持续运行
       max_turnover: 0.5           # 每次调仓最多换掉 50% 的仓位
       weight_method: "score"      # 'equal' (等权) 或 'score' (按预测分数加权)
     initial_capital: 100000.0

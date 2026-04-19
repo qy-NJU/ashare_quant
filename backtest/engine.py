@@ -7,10 +7,11 @@ class BacktestEngine:
         self.data_loader = data_loader
         self.initial_capital = initial_capital
         self.commission = commission
-        
         self.cash = initial_capital
-        self.positions = {} # Symbol -> Quantity
+        self.positions = {}
+        self.position_costs = {}
         self.portfolio_history = []
+        self.trade_log = []
         
     def _get_limit_thresholds(self, symbol):
         """
@@ -55,6 +56,10 @@ class BacktestEngine:
                         df = self.data_loader.get_daily_data(symbol, start_date=start_dt, end_date=date_str)
                         if not df.empty and date_str in df.index.strftime('%Y%m%d').values:
                             today_idx = df.index.get_loc(df[df.index.strftime('%Y%m%d') == date_str].index[0])
+                            vol = df.iloc[today_idx]['volume']
+                            if pd.isna(vol) or vol == 0:
+                                # Stock is suspended
+                                continue
                             current_opens[symbol] = df.iloc[today_idx]['open']
                             if today_idx > 0:
                                 pre_closes[symbol] = df.iloc[today_idx-1]['close']
@@ -95,13 +100,26 @@ class BacktestEngine:
                                 continue
                                 
                             qty = self.positions.pop(symbol)
+                            self.position_costs.pop(symbol, None)
                             # Apply slippage (e.g. 0.002) and stamp duty (0.0005) and commission
                             slippage = 0.002
                             stamp_duty = 0.0005
                             actual_price = price * (1 - slippage)
                             revenue = actual_price * qty * (1 - self.commission - stamp_duty)
+                            fee = actual_price * qty * (self.commission + stamp_duty)
                             self.cash += revenue
-                            print(f"[{date_str}] Sell {symbol}: {qty} shares @ {actual_price:.2f} (Open: {price:.2f})")
+                            
+                            self.trade_log.append({
+                                'date': date_str,
+                                'symbol': symbol,
+                                'action': 'SELL',
+                                'qty': qty,
+                                'price': actual_price,
+                                'amount': revenue,
+                                'fee': fee,
+                                'reason': 'close/stop_loss'
+                            })
+                            # print(f"[{date_str}] Sell {symbol}: {qty} shares @ {actual_price:.2f} (Open: {price:.2f})")
                     else:
                         # Rebalance: Sell partial
                         price = current_opens.get(symbol)
@@ -123,11 +141,29 @@ class BacktestEngine:
                                     stamp_duty = 0.0005
                                     actual_price = price * (1 - slippage)
                                     revenue = actual_price * qty_to_sell * (1 - self.commission - stamp_duty)
+                                    fee = actual_price * qty_to_sell * (self.commission + stamp_duty)
                                     self.cash += revenue
                                     self.positions[symbol] -= qty_to_sell
-                                    print(f"[{date_str}] Sell {symbol}: {qty_to_sell} shares @ {actual_price:.2f} (Open: {price:.2f})")
+                                    if self.positions[symbol] == 0:
+                                        self.position_costs.pop(symbol, None)
+                                        
+                                    self.trade_log.append({
+                                        'date': date_str,
+                                        'symbol': symbol,
+                                        'action': 'SELL',
+                                        'qty': qty_to_sell,
+                                        'price': actual_price,
+                                        'amount': revenue,
+                                        'fee': fee,
+                                        'reason': 'rebalance'
+                                    })
+                                    # print(f"[{date_str}] Sell {symbol}: {qty_to_sell} shares @ {actual_price:.2f} (Open: {price:.2f})")
 
-                # Execute Buys
+                # Re-calculate available cash after all sells are executed
+                available_cash = self.cash
+                
+                # First pass: identify all valid buys and their required cost
+                planned_buys = []
                 for symbol, weight in target_weights.items():
                     target_val = portfolio_value_at_open * weight
                     price = current_opens.get(symbol)
@@ -150,10 +186,34 @@ class BacktestEngine:
                                 slippage = 0.002
                                 actual_price = price * (1 + slippage)
                                 cost = qty_to_buy * actual_price * (1 + self.commission)
-                                if self.cash >= cost:
-                                    self.cash -= cost
-                                    self.positions[symbol] = current_qty + qty_to_buy
-                                    print(f"[{date_str}] Buy {symbol}: {qty_to_buy} shares @ {actual_price:.2f} (Open: {price:.2f})")
+                                fee = qty_to_buy * actual_price * self.commission
+                                planned_buys.append((symbol, qty_to_buy, actual_price, cost, fee))
+
+                # Execute Buys
+                for symbol, qty_to_buy, actual_price, cost, fee in planned_buys:
+                    if self.cash >= cost:
+                        self.cash -= cost
+                        
+                        # Update position and average cost
+                        old_qty = self.positions.get(symbol, 0)
+                        old_cost = self.position_costs.get(symbol, 0.0)
+                        new_qty = old_qty + qty_to_buy
+                        new_avg_cost = (old_qty * old_cost + qty_to_buy * actual_price) / new_qty
+                        
+                        self.positions[symbol] = new_qty
+                        self.position_costs[symbol] = new_avg_cost
+                        
+                        self.trade_log.append({
+                            'date': date_str,
+                            'symbol': symbol,
+                            'action': 'BUY',
+                            'qty': qty_to_buy,
+                            'price': actual_price,
+                            'amount': cost,
+                            'fee': fee,
+                            'reason': 'rebalance'
+                        })
+                        # print(f"[{date_str}] Buy {symbol}: {qty_to_buy} shares @ {actual_price:.2f}")
             
             # --- 2. Mark to Market at T's Close Price ---
             portfolio_value = self.cash
@@ -180,7 +240,13 @@ class BacktestEngine:
             })
             
             # --- 3. Generate Signals for T+1 ---
-            signals = self.strategy.select_stocks(date_str, self.data_loader, current_positions=self.positions)
+            signals = self.strategy.select_stocks(
+                date_str, 
+                self.data_loader, 
+                current_positions=self.positions,
+                current_prices=current_closes,
+                position_costs=self.position_costs
+            )
             
             pending_signals = {}
             if signals is not None and len(signals) > 0:

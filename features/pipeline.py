@@ -50,11 +50,15 @@ class FeaturePipeline:
         # For simple integration, let's keep OHLCV + features
         all_data = pd.concat([df, all_features], axis=1)
         
-        # Drop columns that are all NaN (some factors may not be applicable)
-        all_data = all_data.dropna(axis=1, how='all')
+        # Do NOT drop columns that are all NaN here, because different stocks might have different lengths
+        # and dropping columns dynamically will cause feature mismatch between train and predict phases.
+        # all_data = all_data.dropna(axis=1, how='all')
         
         # Drop duplicate columns (keep first occurrence)
         all_data = all_data.loc[:, ~all_data.columns.duplicated()]
         
         # Usually we want features + labels aligned
-        return all_data.dropna() # Drop rows with NaN (due to rolling/shift)
+        # Do NOT drop all NaNs here, because some pandas-ta features might have NaNs
+        # XGBoost can handle NaNs, or we can fill them later.
+        # We only drop rows where the target label is NaN later in runner.py.
+        return all_data

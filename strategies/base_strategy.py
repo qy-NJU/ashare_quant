@@ -6,7 +6,7 @@ class BaseStrategy(ABC):
         self.name = name
 
     @abstractmethod
-    def select_stocks(self, date, data_loader, current_positions=None):
+    def select_stocks(self, date, data_loader, current_positions=None, current_prices=None, position_costs=None):
         """
         Select stocks for a given date.
         
@@ -14,6 +14,8 @@ class BaseStrategy(ABC):
             date (str): Date in 'YYYYMMDD' format.
             data_loader: Data loader instance or module to fetch data.
             current_positions (dict): Current holdings, e.g., {'600000': 1000}.
+            current_prices (dict): Current prices, e.g., {'600000': 10.5}.
+            position_costs (dict): Holding cost per share, e.g., {'600000': 10.2}.
             
         Returns:
             dict or list: 

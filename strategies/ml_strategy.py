@@ -120,7 +120,7 @@ class MLStrategy(BaseStrategy):
     Strategy based on machine learning predictions.
     """
     def __init__(self, name, model, feature_pipeline, top_k=5, rebalance_period=20, universe=None, 
-                 use_market_filter=False, max_turnover=1.0, weight_method='equal', processor=None, dynamic_filter=None):
+                 use_market_filter=False, max_turnover=1.0, weight_method='equal', processor=None, dynamic_filter=None, target_position_ratio=1.0, **kwargs):
         """
         Args:
             name (str): Strategy name.
@@ -134,6 +134,7 @@ class MLStrategy(BaseStrategy):
             weight_method (str): 'equal' or 'score' (weight by model prediction score).
             processor (CrossSectionalProcessor): Processor for cross-sectional MAD and Z-Score.
             dynamic_filter (DynamicFilter): Filter for zombie/newly listed stocks.
+            target_position_ratio (float): Target total position ratio (0.0 to 1.0).
         """
         super().__init__(name)
         self.model = model
@@ -148,8 +149,12 @@ class MLStrategy(BaseStrategy):
         self.use_market_filter = use_market_filter
         self.max_turnover = max_turnover
         self.weight_method = weight_method
+        self.target_position_ratio = target_position_ratio
         
         self.days_since_rebalance = 0
+        
+        # State to track highest prices for trailing stop
+        self.highest_prices = {}
 
     def _check_market_filter(self, date, data_loader):
         """Simple market filter: check if SH000300 is above 20-day SMA."""
@@ -175,19 +180,87 @@ class MLStrategy(BaseStrategy):
         except:
             return True
 
-    def select_stocks(self, date, data_loader, current_positions=None):
+    def select_stocks(self, date, data_loader, current_positions=None, current_prices=None, position_costs=None):
         """
         Select stocks based on model prediction and advanced rules.
         """
         if current_positions is None:
             current_positions = {}
+        if current_prices is None:
+            current_prices = {}
+        if position_costs is None:
+            position_costs = {}
 
-        # 1. Rebalance frequency check
+        # Clean up highest_prices for symbols no longer held
+        for sym in list(self.highest_prices.keys()):
+            if sym not in current_positions:
+                del self.highest_prices[sym]
+
+        # --- Dynamic Stop Loss & Take Profit (Always Check) ---
+        symbols_to_sell = []
+        stop_loss_threshold = -0.08  # -8% Accumulated Stop Loss
+        daily_drop_threshold = -0.07 # -7% Single day drop (Intraday flush)
+        trailing_stop_threshold = -0.10 # -10% from highest peak (Let profits run but cut if trend reverses)
+        
+        for symbol, qty in current_positions.items():
+            if symbol in position_costs and symbol in current_prices:
+                avg_cost = position_costs[symbol]
+                curr_price = current_prices[symbol]
+                
+                # Update highest price for trailing stop
+                if symbol not in self.highest_prices:
+                    self.highest_prices[symbol] = curr_price
+                else:
+                    self.highest_prices[symbol] = max(self.highest_prices[symbol], curr_price)
+                
+                highest_price = self.highest_prices[symbol]
+                
+                if avg_cost > 0:
+                    pnl_ratio = (curr_price - avg_cost) / avg_cost
+                    
+                    # 1. Trailing Stop Loss (for winning trades)
+                    # Only apply trailing stop if the stock was profitable at its peak
+                    if highest_price > avg_cost * 1.05: # At least 5% profit before activating trailing stop
+                        drawdown_from_peak = (curr_price - highest_price) / highest_price
+                        if drawdown_from_peak <= trailing_stop_threshold:
+                            print(f"[{date}] Trailing Stop Triggered for {symbol}: Peak {highest_price:.2f}, Curr {curr_price:.2f} (Drawdown {drawdown_from_peak*100:.2f}%)")
+                            symbols_to_sell.append(symbol)
+                            continue
+                            
+                    # 2. Accumulated Stop Loss
+                    if pnl_ratio <= stop_loss_threshold:
+                        print(f"[{date}] Accumulated Stop Loss Triggered for {symbol}: PnL {pnl_ratio*100:.2f}% (Cost: {avg_cost:.2f}, Curr: {curr_price:.2f})")
+                        symbols_to_sell.append(symbol)
+                        continue
+                        
+                    # 3. Single Day Drop (if available from data_loader)
+                    # We can fetch yesterday's close to calculate single day drop
+                    try:
+                        df_recent = data_loader.get_daily_data(symbol, start_date=(pd.to_datetime(date)-pd.Timedelta(days=5)).strftime('%Y%m%d'), end_date=date)
+                        if len(df_recent) >= 2:
+                            prev_close = df_recent.iloc[-2]['close']
+                            daily_drop = (curr_price - prev_close) / prev_close
+                            if daily_drop <= daily_drop_threshold:
+                                print(f"[{date}] Daily Flush Stop Loss Triggered for {symbol}: Daily Drop {daily_drop*100:.2f}%")
+                                symbols_to_sell.append(symbol)
+                                continue
+                    except Exception:
+                        pass
+                        
+        # Remove stopped out symbols from active positions
+        active_positions = {s: q for s, q in current_positions.items() if s not in symbols_to_sell}
+
+        # 1. Conditional Rebalance Check (Trend Following logic)
+        # Instead of a strict rebalance_period, we only rebalance if we need to 
+        # (e.g., if we hit stop loss, or if we want to periodically check scores)
+        # We still use days_since_rebalance to prevent trading EVERY single day, but we can make it more flexible.
         if self.days_since_rebalance < self.rebalance_period and self.days_since_rebalance != 0:
             self.days_since_rebalance += 1
-            # Return current positions as target weights (hold)
-            # Assuming equal weight for currently held if we just return keys
-            return list(current_positions.keys())
+            # Return active positions as target weights (hold)
+            if active_positions:
+                w = self.target_position_ratio / len(active_positions)
+                return {s: w for s in active_positions.keys()}
+            return {}
 
         self.days_since_rebalance = 1 # Reset counter
 
@@ -376,9 +449,63 @@ class MLStrategy(BaseStrategy):
         # Sort by score descending
         predictions.sort(key=lambda x: x[1], reverse=True)
 
-        # Select Top K
-        top_predictions = predictions[:self.top_k]
-        selected = [x[0] for x in top_predictions]
+        # --- Filter Illiquid / Limit Up Stocks ---
+        valid_predictions = []
+        for sym, score in predictions:
+            idx = valid_symbols.index(sym)
+            row = X_full.iloc[idx]
+            orig_row = latest_features_list[idx]
+            
+            vol = orig_row.get('volume', 1)
+            is_limit_up = row.get('sub_is_limit_up', 0)
+            
+            if vol == 0 or is_limit_up == 1:
+                # print(f"[{date}] Skipping {sym} due to liquidity/limit-up risk (Score: {score:.4f})")
+                continue
+                
+            valid_predictions.append((sym, score))
+
+        # --- Rebalance: Keep strong old positions even if not in Top K ---
+        # If an active position is very strong (e.g., it was limit up today) OR it still ranks in the top 30%, we keep it
+        forced_keeps = []
+        keep_threshold = int(len(valid_predictions) * 0.3) # Top 30%
+        top_30_symbols = [x[0] for x in valid_predictions[:keep_threshold]]
+        
+        for sym in active_positions.keys():
+            if sym in valid_symbols:
+                idx = valid_symbols.index(sym)
+                is_limit_up = X_full.iloc[idx].get('sub_is_limit_up', 0) == 1
+                is_in_top_30 = sym in top_30_symbols
+                
+                if is_limit_up:
+                    forced_keeps.append(sym)
+                    print(f"[{date}] Letting profits run for {sym} (Limit Up today)")
+                elif is_in_top_30:
+                    forced_keeps.append(sym)
+                    # print(f"[{date}] Holding {sym} (Still in Top 30%)")
+                    
+        # Select Top K from valid predictions, avoiding duplicates with forced_keeps
+        # First, count how many new slots we have
+        new_slots = max(0, self.top_k - len(forced_keeps))
+        
+        selected = list(forced_keeps)
+        for sym, score in valid_predictions:
+            if new_slots <= 0:
+                break
+            if sym not in selected:
+                selected.append(sym)
+                new_slots -= 1
+                
+        # We need to reconstruct top_predictions for score weighting
+        final_top_predictions = []
+        for sym in selected:
+            # Find its score
+            score = 0.01
+            for p_sym, p_score in predictions:
+                if p_sym == sym:
+                    score = p_score
+                    break
+            final_top_predictions.append((sym, score))
 
         # 3. Turnover Control (Optional)
         if self.max_turnover < 1.0 and current_positions:
@@ -401,13 +528,18 @@ class MLStrategy(BaseStrategy):
         if self.weight_method == 'score':
             # Assign weights proportional to prediction score (assuming score > 0)
             # Clip negative scores to 0
-            scores = [max(0.01, x[1]) for x in top_predictions]
+            scores = [max(0.01, x[1]) for x in final_top_predictions]
             total_score = sum(scores)
             if total_score > 0:
-                target_weights = {top_predictions[i][0]: scores[i]/total_score for i in range(len(top_predictions))}
+                target_weights = {final_top_predictions[i][0]: (scores[i]/total_score) * self.target_position_ratio for i in range(len(final_top_predictions))}
                 print(f"[{date}] ML Selected with Score Weights: {target_weights}")
                 return target_weights
                 
-        # Default: Equal weight (just return list)
-        print(f"[{date}] ML Selected: {selected}")
-        return selected
+        # Default: Equal weight (enforce target_position_ratio)
+        if selected:
+            w = self.target_position_ratio / len(selected)
+            target_weights = {sym: w for sym in selected}
+            print(f"[{date}] ML Selected with Equal Weights: {target_weights}")
+            return target_weights
+            
+        return {}

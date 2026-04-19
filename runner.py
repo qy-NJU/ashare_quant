@@ -254,13 +254,13 @@ class PipelineRunner:
             model.load(load_path)
 
             # Prepare data for TODAY (or latest available)
-            # We need enough history to calculate features (e.g. 30-60 days)
-            # Note: Since Baostock free data might not have 2026 data, we mock 'today' as 2023-06-01 for demo
+            # We need enough history to calculate features (pandas-ta needs up to 255 trading days)
+            # 400 calendar days gives us roughly 270 trading days.
             import datetime
             # today = datetime.datetime.now()
             today = datetime.datetime(2023, 6, 1)
             end_date_str = today.strftime('%Y%m%d')
-            start_date_str = (today - datetime.timedelta(days=150)).strftime('%Y%m%d')
+            start_date_str = (today - datetime.timedelta(days=400)).strftime('%Y%m%d')
             
             print(f"Fetching recent data for prediction ({start_date_str} - {end_date_str})...")
             
@@ -388,6 +388,16 @@ class PipelineRunner:
             # Run Engine
             engine = BacktestEngine(strategy, repo, initial_capital=strat_cfg.get('initial_capital', 100000.0))
             results = engine.run(b_start, b_end)
+            
+            # Export Trades
+            os.makedirs('data/backtest', exist_ok=True)
+            if engine.trade_log:
+                trades_df = pd.DataFrame(engine.trade_log)
+                trades_csv = f'data/backtest/trades_{b_start}_{b_end}.csv'
+                trades_df.to_csv(trades_csv, index=False)
+                print(f"Exported {len(engine.trade_log)} trades to {trades_csv}")
+            else:
+                print("No trades executed during backtest.")
 
             print("\nPipeline Execution Completed. Final Results:")
             print(results.tail())
@@ -578,6 +588,25 @@ class PipelineRunner:
                                 num_boost_round=getattr(model, 'num_boost_round', 50))
                 else:
                     model.partial_train(X_full, y_full, groups=groups)
+                    
+                # Evaluate on training set
+                train_preds = model.predict(X_full)
+                from scipy.stats import spearmanr
+                try:
+                    # Calculate Rank IC
+                    rank_ics = []
+                    df_eval = pd.DataFrame({'pred': train_preds, 'true': y_full.values}, index=y_full.index)
+                    for date, group in df_eval.groupby(level=0):
+                        if len(group) > 1 and group['true'].std() > 0:
+                            corr, _ = spearmanr(group['pred'], group['true'])
+                            if not pd.isna(corr):
+                                rank_ics.append(corr)
+                    
+                    mean_ic = sum(rank_ics) / len(rank_ics) if rank_ics else 0
+                    print(f"  --> Training Set Rank IC: {mean_ic:.4f} (over {len(rank_ics)} days)")
+                except Exception as e:
+                    print(f"  --> Could not calculate Rank IC: {e}")
+                    
             else:
                 print("No data available for this window.")
 
@@ -587,10 +616,125 @@ class PipelineRunner:
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             model.save(save_path)
 
-        # 4. Backtesting
+        # --- EVALUATE ON OOS (Backtest) DATA ---
         backtest_win = self.config['windows']['backtest']
         b_start = backtest_win['start'].replace('-', '')
         b_end = backtest_win['end'].replace('-', '')
+        
+        print(f"\n=== Evaluating Predictive Power on OOS Data ({b_start} to {b_end}) ===")
+        
+        # Prepare tasks for OOS feature computation
+        oos_pipeline = self.build_feature_pipeline(include_label=True)
+        dynamic_filter_config = None
+        if enable_filter and dynamic_filter:
+            dynamic_filter_config = {
+                'min_avg_turnover': dynamic_filter.min_avg_turnover,
+                'min_listed_days': dynamic_filter.min_listed_days
+            }
+        oos_pipeline_config = self._serialize_feature_pipeline_config(oos_pipeline)
+        
+        # We need a lookback period to calculate features for b_start
+        # pandas-ta needs up to 255 trading days for some indicators (e.g. PVIe_255). 
+        # 400 calendar days gives us roughly 270 trading days.
+        lookback_days = max(400, dynamic_filter.min_listed_days + 150) if dynamic_filter else 400
+        b_start_fetch = (pd.to_datetime(backtest_win['start']) - pd.Timedelta(days=lookback_days)).strftime('%Y%m%d')
+        
+        benchmark_df = repo.get_daily_data("sh.000300", b_start_fetch, b_end)
+        benchmark_df_dict = benchmark_df.to_dict('list') if not benchmark_df.empty else None
+        benchmark_index = benchmark_df.index.tolist() if not benchmark_df.empty else None
+        
+        data_cache_dir = getattr(repo, 'cache_dir', 'data/local_lake')
+        if not os.path.isabs(data_cache_dir):
+            data_cache_dir = os.path.abspath(data_cache_dir)
+            
+        import hashlib, json
+        config_str = json.dumps(oos_pipeline_config, sort_keys=True)
+        config_hash = hashlib.md5(config_str.encode('utf-8')).hexdigest()[:8]
+        
+        tasks = []
+        for symbol in symbols:
+            # We construct task parameter tuple matching what _compute_stock_features_batch expects
+            # format: (batch_symbols, start_date, end_date, is_train, dynamic_filter_config, feature_pipeline_config, benchmark_close, enable_filter, cache_dir)
+            tasks.append(([symbol], b_start_fetch, b_end, True, dynamic_filter_config, oos_pipeline_config, benchmark_close, enable_filter, data_cache_dir))
+            
+        # Parallel execution
+        X_oos_list = []
+        y_oos_list = []
+        
+        print(f"Computing/Loading OOS features for {len(symbols)} stocks...")
+        with ProcessPoolExecutor(max_workers=min(mp.cpu_count(), 8)) as executor:
+            futures = {executor.submit(_compute_stock_features_batch, task): task[0][0] for task in tasks}
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    res_dict = future.result()
+                    if res_dict and symbol in res_dict:
+                        df = res_dict[symbol]
+                        if df is not None and not df.empty:
+                            # Filter to actual backtest window
+                            df = df.loc[b_start:b_end]
+                            if df.empty: continue
+                            
+                            target_cols = [c for c in df.columns if c.startswith('target_')]
+                            if not target_cols: continue
+                            target_col = target_cols[0]
+                            
+                            df = df.dropna(subset=[target_col])
+                            if df.empty: continue
+                            
+                            X = df.drop(columns=[target_col, 'open', 'high', 'low', 'close', 'volume', 'date', 'symbol'], errors='ignore')
+                            X = X.select_dtypes(include=['number', 'category'])
+                            y = df[target_col]
+                            
+                            X_oos_list.append(X)
+                            y_oos_list.append(y)
+                except Exception as e:
+                    pass
+
+        if X_oos_list:
+            X_oos_full = pd.concat(X_oos_list)
+            y_oos_full = pd.concat(y_oos_list)
+            
+            # Apply Cross-Sectional Processing
+            feature_cols = X_oos_full.columns.tolist()
+            X_oos_full = processor.process(X_oos_full, feature_cols)
+            
+            # Predict
+            oos_preds = model.predict(X_oos_full)
+            
+            # Calculate metrics
+            from scipy.stats import spearmanr
+            import numpy as np
+            
+            rank_ics = []
+            df_eval = pd.DataFrame({'pred': oos_preds, 'true': y_oos_full.values}, index=y_oos_full.index)
+            
+            for date, group in df_eval.groupby(level=0):
+                if len(group) > 1 and group['true'].std() > 0:
+                    corr, _ = spearmanr(group['pred'], group['true'])
+                    if not pd.isna(corr):
+                        rank_ics.append(corr)
+                        
+            mean_ic = sum(rank_ics) / len(rank_ics) if rank_ics else 0
+            icir = (mean_ic / np.std(rank_ics)) if rank_ics and np.std(rank_ics) > 0 else 0
+            
+            print(f"OOS Rank IC: {mean_ic:.4f} (ICIR: {icir:.4f} over {len(rank_ics)} days)")
+            
+            # Accuracy metric (Directional accuracy for top decile vs bottom decile)
+            # This shows if our high-score predictions actually go up more than low-score ones
+            if len(df_eval) > 10:
+                top_10_pct = df_eval['pred'].quantile(0.9)
+                bottom_10_pct = df_eval['pred'].quantile(0.1)
+                
+                top_true_mean = df_eval[df_eval['pred'] >= top_10_pct]['true'].mean()
+                bottom_true_mean = df_eval[df_eval['pred'] <= bottom_10_pct]['true'].mean()
+                
+                print(f"OOS Top 10% Score Avg True Return/Rank: {top_true_mean:.4f}")
+                print(f"OOS Bottom 10% Score Avg True Return/Rank: {bottom_true_mean:.4f}")
+        else:
+            print("No OOS data available for evaluation.")
+
+        # 4. Backtesting
         print(f"\n--- Backtesting Phase: {b_start} to {b_end} ---")
         
         # Build inference pipeline
@@ -609,6 +753,16 @@ class PipelineRunner:
         # Run Engine
         engine = BacktestEngine(strategy, repo, initial_capital=strat_cfg.get('initial_capital', 100000.0))
         results = engine.run(b_start, b_end)
+        
+        # Export Trades
+        os.makedirs('data/backtest', exist_ok=True)
+        if engine.trade_log:
+            trades_df = pd.DataFrame(engine.trade_log)
+            trades_csv = f'data/backtest/trades_{b_start}_{b_end}.csv'
+            trades_df.to_csv(trades_csv, index=False)
+            print(f"Exported {len(engine.trade_log)} trades to {trades_csv}")
+        else:
+            print("No trades executed during backtest.")
         
         print("\nPipeline Execution Completed. Final Results:")
         print(results.tail())

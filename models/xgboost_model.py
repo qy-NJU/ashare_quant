@@ -279,9 +279,15 @@ class XGBoostWrapper(BaseModel):
         X_clean = self._prepare_data(X)
         # Ensure features match training order using saved feature_names
         if self.feature_names is not None:
-            # Only keep features that were used in training, in the same order
-            available_features = [f for f in self.feature_names if f in X_clean.columns]
-            X_clean = X_clean[available_features]
+            # Reorder and align features to match training
+            missing_cols = [col for col in self.feature_names if col not in X_clean.columns]
+            if missing_cols:
+                # Add missing columns with 0
+                for col in missing_cols:
+                    X_clean[col] = 0.0
+                    
+            # Drop extra columns
+            X_clean = X_clean[self.feature_names]
         # Debug: log feature info
         print(f"[DEBUG predict] X_clean shape: {X_clean.shape}, columns: {list(X_clean.columns)[:10]}...")
         print(f"[DEBUG predict] self.feature_names: {self.feature_names[:10] if self.feature_names else None}...")
