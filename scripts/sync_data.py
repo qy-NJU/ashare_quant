@@ -54,17 +54,19 @@ def sync_stock_list(source):
 def sync_industry_mapping():
     print("Syncing Industry Classification from Baostock...")
     import baostock as bs
-    lg = bs.login()
-    if lg.error_code != '0':
-        print("Baostock login failed for industry mapping.")
-        return
-        
+    
+    # 注意：不要在这里单独 login/logout，因为 baostock 使用全局 socket 连接
+    # 多次 login/logout 会导致 socket 被关闭，影响其他数据源的正常使用
+    # 直接查询即可，baostock 会自动复用已有的连接
     rs = bs.query_stock_industry()
     industry_data = []
     while (rs.error_code == '0') & rs.next():
         industry_data.append(rs.get_row_data())
+    
+    if rs.error_code != '0':
+        print(f"Industry query failed: error_code={rs.error_code}, error_msg={rs.error_msg}")
+        return
         
-    bs.logout()
     if industry_data:
         df = pd.DataFrame(industry_data, columns=rs.fields)
         df['symbol'] = df['code'].apply(lambda x: x.split('.')[1] if '.' in x else x)
