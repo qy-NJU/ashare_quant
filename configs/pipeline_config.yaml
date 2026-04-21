@@ -2,7 +2,7 @@
 
 pipeline:
   name: "V4_Config_Driven_Pipeline"
-  mode: "backtest_only"  # 重新训练模型，因为我们修改了 Label 的 horizon
+  mode: "inference"  # 重新训练模型，因为我们修改了 Label 的 horizon
   
   # 数据源配置
   data:
@@ -41,8 +41,8 @@ pipeline:
         end: "2025-12-31"
     # 回测/评测时间段: 2026年3月
     backtest:
-      start: "2026-01-01"
-      end: "2026-04-10"
+      start: "2026-04-15"
+      end: "2026-04-20"
 
   # 特征工程配置
   features:

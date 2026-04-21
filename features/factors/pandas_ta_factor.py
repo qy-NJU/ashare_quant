@@ -1,14 +1,6 @@
 from .base_factor import BaseFactor
 import pandas as pd
 import pandas_ta as ta
-import warnings
-
-# Suppress pandas-ta warnings about missing TA-Lib
-warnings.filterwarnings("ignore")
-try:
-    ta.utils.verbose = False
-except:
-    pass
 
 class PandasTAFactor(BaseFactor):
     """
@@ -40,19 +32,19 @@ class PandasTAFactor(BaseFactor):
                 df_ta.index = pd.to_datetime(df_ta.index)
         
         try:
-            # Note: newer versions of pandas-ta use 'study' instead of 'strategy'
-            # Also, cores=0 is required to prevent multiprocessing conflicts when run inside a ProcessPoolExecutor
-            if hasattr(df_ta.ta, 'study'):
-                ta_func = df_ta.ta.study
-            else:
-                ta_func = df_ta.ta.strategy
-                
             if self.strategy_mode.lower() == "all":
-                ta_func("all", cores=0, verbose=False)
+                df_ta.ta.strategy("all")
             elif self.strategy_mode.lower() == "common":
-                ta_func("common", cores=0, verbose=False)
+                df_ta.ta.strategy("common")
             elif self.strategy_mode.lower() == "custom" and self.features:
-                ta_func("all", cores=0, verbose=False)
+                # To support custom list, we still calculate 'all' or 'common' and then filter
+                # Or we can parse the list and call specific functions, but that's complex mapping.
+                # Easiest way: calculate 'all' and drop others. Efficient way: only call needed.
+                # For now, let's calculate 'all' and then filter, assuming we want flexibility.
+                # Optimization: Many pandas-ta indicators can be called directly.
+                # But mapping "BBU_5_2.0" to ta.bbands(...) is hard without a parser.
+                # So we stick to "all" strategy then filter.
+                df_ta.ta.strategy("all")
             else:
                 # Custom default small set
                 df_ta.ta.sma(length=5, append=True)
@@ -62,7 +54,6 @@ class PandasTAFactor(BaseFactor):
                 df_ta.ta.bbands(length=20, append=True)
                 
         except Exception as e:
-            # print(f"PandasTAFactor Exception: {e}")
             try:
                 if self.strategy_mode.lower() in ["all", "common", "custom"]:
                     df_ta.ta.sma(length=10, append=True)

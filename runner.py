@@ -218,7 +218,39 @@ class PipelineRunner:
         print("No symbols or pool config found. Returning empty list.")
         return []
 
+    def _run_analysis(self, results, engine, model_metrics=None):
+        if results is None or results.empty:
+            print("No results to analyze.")
+            return
+            
+        print("\nRunning Strategy Analysis...")
+        try:
+            from analysis import StrategyEvaluator, ReportGenerator
+        except ImportError as e:
+            print(f"Could not import analysis module: {e}")
+            return
+            
+        evaluator = StrategyEvaluator()
+        
+        # Calculate daily returns from portfolio value
+        results['daily_return'] = results['value'].pct_change().fillna(0)
+        strategy_metrics = evaluator.evaluate_returns(results['daily_return'])
+        
+        trades_df = pd.DataFrame(engine.trade_log) if engine.trade_log else pd.DataFrame()
+        trade_stats = evaluator.analyze_trades(trades_df)
+        
+        reporter = ReportGenerator()
+        report_path = reporter.generate_markdown_report(
+            model_metrics=model_metrics,
+            strategy_metrics=strategy_metrics,
+            trade_stats=trade_stats
+        )
+        print(f"Analysis Report generated at: {report_path}")
+
     def run(self):
+        """
+        Execute the full pipeline based on config
+        """
         mode = self.config.get('mode', 'train')
         
         # 1. Init Data
@@ -243,110 +275,77 @@ class PipelineRunner:
         min_listed_days = filter_cfg.get('min_listed_days', 120)    # Default half year
         dynamic_filter = DynamicFilter(min_avg_turnover=min_turnover, min_listed_days=min_listed_days)
         
-        # --- INFERENCE MODE ---
-        if mode == 'inference':
-            print("\n=== RUNNING IN INFERENCE MODE ===")
-            # Load model
-            load_path = self.config['model'].get('load_path')
-            if not load_path or not os.path.exists(load_path):
-                print(f"Error: load_path {load_path} not found for inference.")
+        # --- 1. PREDICT ONLY MODE ---
+        if mode == 'predict_only':
+            print("\n=== STARTING PREDICTION MODE ===")
+            
+            # Load the model
+            model_cfg = self.config['model']
+            model_path = model_cfg.get('load_path', 'models/saved/config_xgb.json')
+            
+            import os
+            if not os.path.exists(model_path):
+                print(f"Error: Model file not found at {model_path}")
                 return
-            model.load(load_path)
-
-            # Prepare data for TODAY (or latest available)
-            # We need enough history to calculate features (pandas-ta needs up to 255 trading days)
-            # 400 calendar days gives us roughly 270 trading days.
-            import datetime
-            # today = datetime.datetime.now()
-            today = datetime.datetime(2023, 6, 1)
-            end_date_str = today.strftime('%Y%m%d')
-            start_date_str = (today - datetime.timedelta(days=400)).strftime('%Y%m%d')
+                
+            model = self._instantiate_class(model_cfg['name'], model_cfg.get('params', {}))
+            model.load(model_path)
+            print(f"Model loaded successfully from {model_path}")
             
-            print(f"Fetching recent data for prediction ({start_date_str} - {end_date_str})...")
+            # Target prediction date
+            pred_cfg = self.config.get('prediction', {})
+            target_date = pred_cfg.get('target_date')
+            if not target_date:
+                print("Error: 'prediction.target_date' not specified in config.")
+                return
             
-            # Build inference pipeline
+            # Clean date formatting
+            target_date_clean = target_date.replace('-', '')
+            print(f"Generating Top N predictions based on data up to {target_date_clean}...")
+            
+            # Build feature pipeline without labels
             infer_pipeline = self.build_feature_pipeline(include_label=False)
             
-            # For excess return or ranking, we might need a benchmark
-            # Let's fetch benchmark data once per window (sh.000300 is HS300 in Baostock)
-            benchmark_df = repo.get_daily_data("sh.000300", start_date_str, end_date_str)
-            benchmark_close = benchmark_df['close'].iloc[-1] if not benchmark_df.empty else None
+            # We use MLStrategy's select_stocks logic directly to generate signals
+            strat_cfg = self.config['strategy']
+            strat_params = strat_cfg.get('params', {})
+            strategy = MLStrategy(name="YAML_Strategy", model=model, feature_pipeline=infer_pipeline, universe=symbols, 
+                                  processor=processor, dynamic_filter=dynamic_filter, **strat_params)
+                                  
+            # Fake a 'cash' holding just to trigger normal rebalance logic
+            current_positions = {}
+            current_prices = {}
+            position_costs = {}
             
-            # --- Apply Cross-Sectional Processing on Predictions (if needed) ---
-            print("Gathering features for all symbols to apply cross-sectional processing...")
+            # Force days_since_rebalance so it actually predicts
+            strategy.days_since_rebalance = strategy.rebalance_period + 1 
             
-            # Use multiprocessing for feature computation in inference mode
-            num_workers = min(mp.cpu_count(), 8)
-            batch_size = 50
-            batches = [symbols[i:i+batch_size] for i in range(0, len(symbols), batch_size)]
+            target_weights = strategy.select_stocks(
+                target_date_clean, 
+                repo, 
+                current_positions=current_positions,
+                current_prices=current_prices,
+                position_costs=position_costs
+            )
             
-            dynamic_filter_config = None
-            if enable_filter and dynamic_filter:
-                dynamic_filter_config = {
-                    'min_avg_turnover': dynamic_filter.min_avg_turnover,
-                    'min_listed_days': dynamic_filter.min_listed_days
-                }
-            feature_pipeline_config = self._serialize_feature_pipeline_config(infer_pipeline)
-            data_cache_dir = self.config['data'].get('cache_dir', 'data/local_lake')
-            if not os.path.isabs(data_cache_dir):
-                data_cache_dir = os.path.abspath(data_cache_dir)
+            if not target_weights:
+                print("No stocks selected. Check market filters or data availability.")
+            else:
+                print(f"\n--- TOP STOCKS TO BUY FOR NEXT TRADING DAY ---")
+                print(f"Based on data at: {target_date}")
                 
-            tasks = [(batch, start_date_str, end_date_str, False, dynamic_filter_config, feature_pipeline_config, benchmark_close, enable_filter, data_cache_dir)
-                     for batch in batches]
-                     
-            latest_features_list = []
-            valid_symbols = []
-            
-            print(f"Computing features for {len(symbols)} stocks in {len(batches)} batches ({num_workers} workers)...")
-            completed_batches = 0
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                futures = {executor.submit(_compute_stock_features_batch, task): task[0] for task in tasks}
-                for future in as_completed(futures):
-                    batch_results = future.result()  # dict: sym -> features_df
-                    completed_batches += 1
-                    print(f"  Batch {completed_batches}/{len(batches)} completed")
+                # Fetch stock names
+                try:
+                    stock_list = repo.get_stock_list()
+                    name_map = dict(zip(stock_list['symbol'], stock_list['name']))
+                except:
+                    name_map = {}
                     
-                    for sym, features_df in batch_results.items():
-                        if features_df is None or features_df.empty:
-                            continue
-                        
-                        # Take the LATEST row for prediction
-                        latest_features = features_df.iloc[[-1]]
-                        latest_features_list.append(latest_features)
-                        valid_symbols.append(sym)
-            
-            if not latest_features_list:
-                print("No features generated.")
-                return
-                
-            # Combine all latest features
-            X_infer_full = pd.concat(latest_features_list)
-            
-            # Apply Cross-Sectional Processing
-            feature_cols = X_infer_full.drop(columns=['open', 'high', 'low', 'close', 'volume', 'date', 'symbol'], errors='ignore').columns.tolist()
-            X_infer_full = processor.process(X_infer_full, feature_cols)
-            
-            # Predict
-            X_pred = X_infer_full[feature_cols]
-            scores = model.predict(X_pred)
-            
-            predictions = []
-            for i, sym in enumerate(valid_symbols):
-                latest_date = X_infer_full.index[i].strftime('%Y-%m-%d')
-                predictions.append({'symbol': sym, 'score': scores[i], 'data_date': latest_date})
-                
-            pred_df = pd.DataFrame(predictions)
-            pred_df = pred_df.sort_values('score', ascending=False)
-            
-            top_k = self.config['strategy']['params'].get('top_k', 10)
-            print(f"\n=== Top {top_k} Predictions based on latest available data ===")
-            print(pred_df[['symbol', 'score', 'data_date']].head(top_k))
-            
-            # Save predictions
-            os.makedirs('data/predictions', exist_ok=True)
-            out_file = f"data/predictions/pred_{end_date_str}.csv"
-            pred_df.to_csv(out_file, index=False)
-            print(f"\nFull predictions saved to {out_file}")
+                for sym, weight in sorted(target_weights.items(), key=lambda x: x[1], reverse=True):
+                    name = name_map.get(sym, "Unknown")
+                    print(f"⭐ Symbol: {sym:<8} | Name: {name:<10} | Target Weight: {weight*100:.1f}%")
+                    
+            print("================================================\n")
             return
 
         # --- BACKTEST ONLY MODE (skip training, use saved model) ---
@@ -401,6 +400,10 @@ class PipelineRunner:
 
             print("\nPipeline Execution Completed. Final Results:")
             print(results.tail())
+            
+            # Run Analysis
+            self._run_analysis(results, engine)
+            
             return
 
         # --- TRAIN/BACKTEST MODE ---
@@ -410,6 +413,8 @@ class PipelineRunner:
         
         # 3. Training Loop (Incremental)
         train_windows = self.config['windows'].get('train', [])
+        
+        last_model_metrics = None
         for i, window in enumerate(train_windows):
             start = window['start'].replace('-', '')
             end = window['end'].replace('-', '')
@@ -591,21 +596,28 @@ class PipelineRunner:
                     
                 # Evaluate on training set
                 train_preds = model.predict(X_full)
-                from scipy.stats import spearmanr
+                
                 try:
-                    # Calculate Rank IC
-                    rank_ics = []
-                    df_eval = pd.DataFrame({'pred': train_preds, 'true': y_full.values}, index=y_full.index)
-                    for date, group in df_eval.groupby(level=0):
-                        if len(group) > 1 and group['true'].std() > 0:
-                            corr, _ = spearmanr(group['pred'], group['true'])
-                            if not pd.isna(corr):
-                                rank_ics.append(corr)
+                    from analysis import ModelEvaluator
+                    df_eval = pd.DataFrame({
+                        'date': y_full.index,
+                        'true': y_full.values,
+                        'pred': train_preds
+                    })
+                    ic_series = ModelEvaluator.calculate_ic_series(df_eval, 'date', 'true', 'pred')
+                    mean_ic = ic_series['IC'].mean()
+                    mean_rank_ic = ic_series['Rank_IC'].mean()
                     
-                    mean_ic = sum(rank_ics) / len(rank_ics) if rank_ics else 0
-                    print(f"  --> Training Set Rank IC: {mean_ic:.4f} (over {len(rank_ics)} days)")
+                    reg_metrics = ModelEvaluator.evaluate_regression(df_eval['true'], df_eval['pred'])
+                    reg_metrics['Mean_IC_Series'] = float(mean_ic)
+                    reg_metrics['Mean_Rank_IC_Series'] = float(mean_rank_ic)
+                    
+                    last_model_metrics = reg_metrics
+                    
+                    print(f"  --> Training Set Rank IC: {mean_rank_ic:.4f} (over {len(ic_series.dropna())} days)")
+                    print(f"  --> Training Set MSE: {reg_metrics['MSE']:.4f}")
                 except Exception as e:
-                    print(f"  --> Could not calculate Rank IC: {e}")
+                    print(f"  --> Could not calculate Model Metrics: {e}")
                     
             else:
                 print("No data available for this window.")
@@ -756,6 +768,7 @@ class PipelineRunner:
         
         # Export Trades
         os.makedirs('data/backtest', exist_ok=True)
+        trades_df = pd.DataFrame()
         if engine.trade_log:
             trades_df = pd.DataFrame(engine.trade_log)
             trades_csv = f'data/backtest/trades_{b_start}_{b_end}.csv'
@@ -766,6 +779,9 @@ class PipelineRunner:
         
         print("\nPipeline Execution Completed. Final Results:")
         print(results.tail())
+        
+        # Run Analysis
+        self._run_analysis(results, engine, model_metrics=last_model_metrics)
 
 import sys
 

@@ -202,6 +202,27 @@ class MLStrategy(BaseStrategy):
         daily_drop_threshold = -0.07 # -7% Single day drop (Intraday flush)
         trailing_stop_threshold = -0.10 # -10% from highest peak (Let profits run but cut if trend reverses)
         
+        # 1. Evaluate Old Positions Health (Longfeihu Strategy)
+        losing_positions_count = 0
+        for symbol, qty in current_positions.items():
+            if symbol in position_costs and symbol in current_prices:
+                avg_cost = position_costs[symbol]
+                curr_price = current_prices[symbol]
+                if avg_cost > 0:
+                    pnl_ratio = (curr_price - avg_cost) / avg_cost
+                    if pnl_ratio < -0.03: # Floating loss > 3% is considered weak
+                        losing_positions_count += 1
+                        
+        # 2. Dynamic Position Sizing based on Health
+        allow_new_buys = True
+        dynamic_target_ratio = self.target_position_ratio
+        
+        if len(current_positions) > 0 and losing_positions_count >= len(current_positions) / 2.0:
+            # Headwind period: More than half of old positions are weak. Stop new buys and reduce target ratio.
+            allow_new_buys = False
+            dynamic_target_ratio = max(0.3, self.target_position_ratio / 2.0)
+            print(f"[{date}] 【逆风期风控】老仓表现恶劣 (弱势比例: {losing_positions_count}/{len(current_positions)})，停止开新仓，总仓位目标压降至 {dynamic_target_ratio*100:.0f}%")
+        
         for symbol, qty in current_positions.items():
             if symbol in position_costs and symbol in current_prices:
                 avg_cost = position_costs[symbol]
@@ -218,23 +239,27 @@ class MLStrategy(BaseStrategy):
                 if avg_cost > 0:
                     pnl_ratio = (curr_price - avg_cost) / avg_cost
                     
-                    # 1. Trailing Stop Loss (for winning trades)
-                    # Only apply trailing stop if the stock was profitable at its peak
-                    if highest_price > avg_cost * 1.05: # At least 5% profit before activating trailing stop
+                    # Trailing Stop Loss (for winning trades)
+                    if highest_price > avg_cost * 1.05:
                         drawdown_from_peak = (curr_price - highest_price) / highest_price
                         if drawdown_from_peak <= trailing_stop_threshold:
                             print(f"[{date}] Trailing Stop Triggered for {symbol}: Peak {highest_price:.2f}, Curr {curr_price:.2f} (Drawdown {drawdown_from_peak*100:.2f}%)")
                             symbols_to_sell.append(symbol)
                             continue
                             
-                    # 2. Accumulated Stop Loss
+                    # Accumulated Stop Loss
                     if pnl_ratio <= stop_loss_threshold:
                         print(f"[{date}] Accumulated Stop Loss Triggered for {symbol}: PnL {pnl_ratio*100:.2f}% (Cost: {avg_cost:.2f}, Curr: {curr_price:.2f})")
                         symbols_to_sell.append(symbol)
                         continue
                         
-                    # 3. Single Day Drop (if available from data_loader)
-                    # We can fetch yesterday's close to calculate single day drop
+                    # In headwind period, accelerate closing of weak positions (accelerated stop loss)
+                    if not allow_new_buys and pnl_ratio < -0.05:
+                        print(f"[{date}] Headwind Accelerated Stop Loss Triggered for {symbol}: PnL {pnl_ratio*100:.2f}%")
+                        symbols_to_sell.append(symbol)
+                        continue
+                        
+                    # Single Day Drop
                     try:
                         df_recent = data_loader.get_daily_data(symbol, start_date=(pd.to_datetime(date)-pd.Timedelta(days=5)).strftime('%Y%m%d'), end_date=date)
                         if len(df_recent) >= 2:
@@ -250,15 +275,18 @@ class MLStrategy(BaseStrategy):
         # Remove stopped out symbols from active positions
         active_positions = {s: q for s, q in current_positions.items() if s not in symbols_to_sell}
 
-        # 1. Conditional Rebalance Check (Trend Following logic)
-        # Instead of a strict rebalance_period, we only rebalance if we need to 
-        # (e.g., if we hit stop loss, or if we want to periodically check scores)
-        # We still use days_since_rebalance to prevent trading EVERY single day, but we can make it more flexible.
+        # 3. Conditional Rebalance Check
+        # If we are in headwind and stopped buying, we should return scaled down active positions
+        if not allow_new_buys:
+            if active_positions:
+                w = dynamic_target_ratio / len(active_positions)
+                return {s: w for s in active_positions.keys()}
+            return {}
+
         if self.days_since_rebalance < self.rebalance_period and self.days_since_rebalance != 0:
             self.days_since_rebalance += 1
-            # Return active positions as target weights (hold)
             if active_positions:
-                w = self.target_position_ratio / len(active_positions)
+                w = dynamic_target_ratio / len(active_positions)
                 return {s: w for s in active_positions.keys()}
             return {}
 
@@ -526,18 +554,21 @@ class MLStrategy(BaseStrategy):
                 
         # 4. Weight Allocation
         if self.weight_method == 'score':
-            # Assign weights proportional to prediction score (assuming score > 0)
-            # Clip negative scores to 0
-            scores = [max(0.01, x[1]) for x in final_top_predictions]
-            total_score = sum(scores)
-            if total_score > 0:
-                target_weights = {final_top_predictions[i][0]: (scores[i]/total_score) * self.target_position_ratio for i in range(len(final_top_predictions))}
-                print(f"[{date}] ML Selected with Score Weights: {target_weights}")
-                return target_weights
+            # Assign weights proportional to prediction score
+            # Since scores from rank:pairwise can be anything (including negative or very small differences),
+            # we use softmax to convert them into meaningful probabilities/weights.
+            scores = np.array([x[1] for x in final_top_predictions])
+            # Subtract max for numerical stability
+            exp_scores = np.exp(scores - np.max(scores))
+            softmax_weights = exp_scores / np.sum(exp_scores)
+            
+            target_weights = {final_top_predictions[i][0]: float(softmax_weights[i]) * dynamic_target_ratio for i in range(len(final_top_predictions))}
+            print(f"[{date}] ML Selected with Score Weights: {target_weights}")
+            return target_weights
                 
-        # Default: Equal weight (enforce target_position_ratio)
+        # Default: Equal weight (enforce dynamic_target_ratio)
         if selected:
-            w = self.target_position_ratio / len(selected)
+            w = dynamic_target_ratio / len(selected)
             target_weights = {sym: w for sym in selected}
             print(f"[{date}] ML Selected with Equal Weights: {target_weights}")
             return target_weights

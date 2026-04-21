@@ -213,6 +213,47 @@ def sync_lhb_data(start_date='20200101', end_date=None):
     except Exception as e:
         print(f"Failed to fetch LHB data: {e}")
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import cpu_count
+
+# Global variable to hold the worker-specific BaostockSource instance
+worker_source = None
+
+def _worker_init():
+    """
+    Initializer for ProcessPoolExecutor workers.
+    Each worker logs into Baostock exactly once when it starts.
+    """
+    global worker_source
+    import sys
+    import os
+    # Completely suppress baostock C++ stdout/stderr (e.g. Bad file descriptor errors on exit)
+    devnull = open(os.devnull, 'w')
+    sys.stdout = devnull
+    sys.stderr = devnull
+    
+    # We initialize it with auto_login=True (the default), so it logs in now
+    worker_source = BaostockSource()
+    
+    # Restore stdout for the worker so it can return results, but keep stderr suppressed
+    sys.stdout = sys.__stdout__
+
+def _sync_single_symbol(task_params):
+    """
+    Worker function to sync data for a single symbol.
+    Uses the globally initialized worker_source to avoid repeated login/logouts.
+    """
+    sym, start_date, end_date, start_year, end_year = task_params
+    global worker_source
+    
+    try:
+        sync_daily_data_for_symbol(worker_source, sym, start_date=start_date, end_date=end_date)
+        sync_financial_data_for_symbol(worker_source, sym, start_year=start_year, end_year=end_year)
+        sync_fund_flow_for_symbol(sym)
+        return (sym, True, None)
+    except Exception as e:
+        return (sym, False, str(e))
+
 def sync_all_daily_data(symbols_limit=None, start_date='2020-01-01'):
     source = BaostockSource()
     
@@ -236,27 +277,48 @@ def sync_all_daily_data(symbols_limit=None, start_date='2020-01-01'):
     print(f"Starting daily data sync for {len(symbols)} symbols...")
     
     end_date = datetime.datetime.now().strftime('%Y-%m-%d')
+    start_year = int(start_date.split('-')[0])
+    end_year = int(end_date.split('-')[0])
     
-    count = 0
-    for sym in symbols:
-        count += 1
-        if count % 100 == 0:
-            print(f"Progress: {count}/{len(symbols)}...")
-            
-        sync_daily_data_for_symbol(source, sym, start_date=start_date, end_date=end_date)
+    # Prepare tasks for multiprocessing
+    tasks = [(sym, start_date, end_date, start_year, end_year) for sym in symbols]
+    
+    # Logout the main thread's baostock connection before forking to avoid socket issues
+    try:
+        import baostock as bs
+        bs.logout()
+    except:
+        pass
         
-        # Also sync financial data
-        start_year = int(start_date.split('-')[0])
-        sync_financial_data_for_symbol(source, sym, start_year=start_year, end_year=int(end_date.split('-')[0]))
+    # Use multiprocessing to speed up fetching
+    num_workers = min(cpu_count(), 16) # Cap workers to avoid overwhelming APIs
+    print(f"Using {num_workers} parallel workers...")
+    
+    success_count = 0
+    failed_symbols = []
+    
+    with ProcessPoolExecutor(max_workers=num_workers, initializer=_worker_init) as executor:
+        futures = {executor.submit(_sync_single_symbol, task): task[0] for task in tasks}
         
-        # Also sync fund flow data
-        sync_fund_flow_for_symbol(sym)
-        
-        # Simple rate limiting for Baostock
-        if count % 50 == 0:
-            time.sleep(1)
-            
-    print("All sync tasks completed.")
+        count = 0
+        for future in as_completed(futures):
+            count += 1
+            sym = futures[future]
+            try:
+                _, success, error = future.result()
+                if success:
+                    success_count += 1
+                else:
+                    failed_symbols.append((sym, error))
+            except Exception as e:
+                failed_symbols.append((sym, str(e)))
+                
+            if count % 100 == 0 or count == len(symbols):
+                print(f"Progress: {count}/{len(symbols)} (Success: {success_count}, Failed: {len(failed_symbols)})...")
+                
+    print(f"All sync tasks completed. Success: {success_count}, Failed: {len(failed_symbols)}")
+    if failed_symbols:
+        print(f"Sample failures: {failed_symbols[:5]}")
 
 if __name__ == "__main__":
     import argparse

@@ -9,19 +9,27 @@ class BaostockSource(BaseDataSource):
     """
     _login_count = 0
 
-    def __init__(self):
+    def __init__(self, auto_login=True):
         super().__init__("Baostock")
-        self._ensure_login()
+        self.auto_login = auto_login
+        if self.auto_login:
+            self._ensure_login()
 
     def __del__(self):
-        self._ensure_logout()
+        if self.auto_login:
+            self._ensure_logout()
 
     @classmethod
     def _ensure_login(cls):
         if cls._login_count == 0:
-            lg = bs.login()
+            import contextlib
+            import os
+            # Suppress Baostock's hardcoded "login success!" stdout
+            with open(os.devnull, 'w') as fnull:
+                with contextlib.redirect_stdout(fnull):
+                    lg = bs.login()
             if lg.error_code == '0':
-                print("Baostock login success!")
+                pass
             else:
                 print(f"Baostock login failed: {lg.error_msg}")
         cls._login_count += 1
@@ -29,9 +37,17 @@ class BaostockSource(BaseDataSource):
     @classmethod
     def _ensure_logout(cls):
         cls._login_count -= 1
-        if cls._login_count == 0:
-            bs.logout()
-            print("Baostock logout success!")
+        if cls._login_count <= 0:
+            cls._login_count = 0
+            try:
+                import contextlib
+                import os
+                # Suppress Baostock's hardcoded "logout success!" stdout
+                with open(os.devnull, 'w') as fnull:
+                    with contextlib.redirect_stdout(fnull):
+                        bs.logout()
+            except:
+                pass
 
     def _convert_symbol(self, symbol):
         """Convert standard symbol (e.g. 600000) to Baostock format (sh.600000)."""

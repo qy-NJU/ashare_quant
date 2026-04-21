@@ -1,24 +1,46 @@
-# Quantitative Pipeline Configuration - Prediction Mode
+# Quantitative Pipeline Configuration - Inference Mode (Predict Next Day)
 
 pipeline:
-  name: "V4_Real_Time_Prediction"
-  mode: "inference"  # 新增模式：推理/实盘预测
+  name: "V4_Inference_Pipeline"
+  mode: "predict_only"  # 新增的预测模式，只加载模型输出当天分数，不跑回测
   
   # 数据源配置
   data:
     sources:
-      - "AkShareSource"
+      - "BaostockSource"
     cache_dir: "data/local_lake"
+    
+    symbols: [] # 为空则使用 pool 过滤
     pool:
-      board: "main"
-      exchange: "sh"
-      max_count: 5 # 极速演示模式
+      board: "all"        
+      exchange: "all"     
+      exclude_st: true    
+      max_count: 0       
 
-  # 特征工程配置 (必须与训练时完全一致！)
+  # 预测日期配置 (设置你要计算信号的那天，通常是最新交易日)
+  prediction:
+    target_date: "2026-04-20"  # 根据此日期的盘后数据，预测 T+1 日的 Top N 股票
+
+  # 特征预处理配置 (必须与训练时保持一致)
+  preprocessing:
+    dynamic_filter:       
+      enable: true
+      min_avg_turnover: 10000000  
+      min_listed_days: 120        
+    mad_clip: true        
+    z_score: true         
+
+  # 特征工程配置 (必须与训练时完全一致)
   features:
     - name: "MarketFactor"
       params:
         index_symbol: "sh.000300"
+    - name: "SubjectiveFactor"  
+      params: {}
+    - name: "PatternFactor"     
+      params: {}
+    - name: "EventFactor"       
+      params: {}
     - name: "BoardFactor"
       params:
         encode_method: "category"
@@ -28,20 +50,17 @@ pipeline:
       params: {}
     - name: "PandasTAFactor"
       params: 
-        strategy: "custom"
-        # 必须使用训练时筛选出的精简因子集
-        features: ['BBU_5_2.0_2.0', 'BBL_5_2.0_2.0', 'fin_net_profit', 'MACDs_12_26_9', 'MACD_12_26_9', 'main_net_inflow', 'fin_yoy_ni', 'D_9_3', 'MACDh_12_26_9', 'BBM_5_2.0_2.0', 'J_9_3', 'BBB_5_2.0_2.0', 'ATRr_14', 'SMA_10', 'main_net_ratio', 'fin_roe', 'RSI_14', 'OBV', 'BBP_5_2.0_2.0', 'super_net_ratio', 'K_9_3', 'benchmark_close']
-    # LabelGenerator 在推理模式下不需要，因为我们不知道未来的标签
+        strategy: "all"
 
-  # 模型配置
+  # 模型配置 (用于加载已训练好的模型)
   model:
     name: "XGBoostWrapper"
-    # 加载之前训练好的模型
-    load_path: "models/saved/config_xgb.json"
+    params: {}  # XGBoostWrapper 不需要 params 就可以通过 load_path 加载
+    load_path: "models/saved/config_xgb.json" # 指定之前训练好的模型文件路径
 
-  # 策略配置
+  # 选股策略配置 (决定输出多少只股票)
   strategy:
     name: "MLStrategy"
     params:
-      top_k: 10                   # 选出 Top 10
-      use_market_filter: true     # 开启大盘风控 (如果大盘跌破趋势线，可能不推荐买入)
+      top_k: 4                    # 输出排名前 4 的股票
+      weight_method: "score"      # 按预测分数分配权重 (默认为 equal)
