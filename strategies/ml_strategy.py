@@ -81,12 +81,12 @@ def _process_single_stock(args):
             if df.empty:
                 return None
 
-        # Merge benchmark: compute latest close from benchmark_df_dict for PandasTAFactor
-        if benchmark_df_dict is not None:
-            benchmark_df_worker = pd.DataFrame(benchmark_df_dict)
-            if not benchmark_df_worker.empty and 'close' in benchmark_df_worker.columns:
-                bench_close_value = benchmark_df_worker['close'].iloc[-1]
-                df['benchmark_close'] = bench_close_value
+        # Merge benchmark_close as time-aligned series (not scalar)
+        # This fixes a bug where iloc[-1] broadcast the same value to all rows,
+        # making excess-return features degenerate
+        if benchmark_df_worker is not None and 'close' in benchmark_df_worker.columns:
+            aligned_benchmark = benchmark_df_worker['close'].reindex(df.index, method='ffill')
+            df['benchmark_close'] = aligned_benchmark
 
         # Inject symbol
         df['symbol'] = symbol
@@ -119,7 +119,7 @@ class MLStrategy(BaseStrategy):
     """
     Strategy based on machine learning predictions.
     """
-    def __init__(self, name, model, feature_pipeline, top_k=5, rebalance_period=20, universe=None, 
+    def __init__(self, name, model, feature_pipeline, top_k=5, rebalance_period=20, universe=None,
                  use_market_filter=False, max_turnover=1.0, weight_method='equal', processor=None, dynamic_filter=None, target_position_ratio=1.0, **kwargs):
         """
         Args:
@@ -135,6 +135,14 @@ class MLStrategy(BaseStrategy):
             processor (CrossSectionalProcessor): Processor for cross-sectional MAD and Z-Score.
             dynamic_filter (DynamicFilter): Filter for zombie/newly listed stocks.
             target_position_ratio (float): Target total position ratio (0.0 to 1.0).
+
+            ATR Adaptive Stop-Loss params:
+                atr_stop_mult (float): Stop when loss > N * ATR below entry. Default 2.5.
+                atr_daily_drop_mult (float): Stop when daily drop > N * ATR. Default 2.0.
+                atr_trail_mult (float): Normal trailing stop at peak - N * ATR. Default 3.0.
+            Trailing Profit params:
+                take_profit_activate (float): Profit threshold to activate tight trail. Default 0.15.
+                take_profit_trail (float): Tight trailing drawdown from peak. Default 0.08.
         """
         super().__init__(name)
         self.model = model
@@ -144,17 +152,49 @@ class MLStrategy(BaseStrategy):
         self.universe = universe
         self.processor = processor
         self.dynamic_filter = dynamic_filter
-        
+
         # Advanced configurations
         self.use_market_filter = use_market_filter
         self.max_turnover = max_turnover
         self.weight_method = weight_method
         self.target_position_ratio = target_position_ratio
-        
+
+        # ATR adaptive stop-loss parameters
+        self.atr_stop_mult = kwargs.get('atr_stop_mult', 2.5)
+        self.atr_daily_drop_mult = kwargs.get('atr_daily_drop_mult', 2.0)
+        self.atr_trail_mult = kwargs.get('atr_trail_mult', 3.0)
+
+        # Trailing profit / take-profit parameters
+        self.take_profit_activate = kwargs.get('take_profit_activate', 0.15)
+        self.take_profit_trail = kwargs.get('take_profit_trail', 0.08)
+
         self.days_since_rebalance = 0
-        
+
         # State to track highest prices for trailing stop
         self.highest_prices = {}
+
+    def _compute_atr(self, symbol, date, data_loader, period=14):
+        """Compute ATR(14) for a stock. Returns None if insufficient data."""
+        try:
+            df = data_loader.get_daily_data(
+                symbol,
+                start_date=(pd.to_datetime(date) - pd.Timedelta(days=period * 3)).strftime('%Y%m%d'),
+                end_date=date)
+            if len(df) < period:
+                return None
+
+            high = df['high']
+            low = df['low']
+            close = df['close'].shift(1)
+
+            tr1 = high - low
+            tr2 = (high - close).abs()
+            tr3 = (low - close).abs()
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            atr = tr.rolling(period).mean().iloc[-1]
+            return atr if pd.notna(atr) and atr > 0 else None
+        except Exception:
+            return None
 
     def _check_market_filter(self, date, data_loader):
         """Simple market filter: check if SH000300 is above 20-day SMA."""
@@ -196,12 +236,17 @@ class MLStrategy(BaseStrategy):
             if sym not in current_positions:
                 del self.highest_prices[sym]
 
-        # --- Dynamic Stop Loss & Take Profit (Always Check) ---
+        # --- ATR-Adaptive Stop Loss & Take Profit (Always Check) ---
+        # Thresholds adapt to each stock's volatility personality via ATR(14).
+        # High-vol stocks get wider stops; low-vol stocks get tighter stops.
+        # Fallback to fixed percentages when ATR cannot be computed.
         symbols_to_sell = []
-        stop_loss_threshold = -0.08  # -8% Accumulated Stop Loss
-        daily_drop_threshold = -0.07 # -7% Single day drop (Intraday flush)
-        trailing_stop_threshold = -0.10 # -10% from highest peak (Let profits run but cut if trend reverses)
-        
+
+        # Fixed fallback thresholds (used only when ATR unavailable)
+        fallback_stop_loss = -0.12
+        fallback_daily_drop = -0.09
+        fallback_trail = -0.15
+
         # 1. Evaluate Old Positions Health (Longfeihu Strategy)
         losing_positions_count = 0
         for symbol, qty in current_positions.items():
@@ -210,63 +255,93 @@ class MLStrategy(BaseStrategy):
                 curr_price = current_prices[symbol]
                 if avg_cost > 0:
                     pnl_ratio = (curr_price - avg_cost) / avg_cost
-                    if pnl_ratio < -0.03: # Floating loss > 3% is considered weak
+                    if pnl_ratio < -0.03:
                         losing_positions_count += 1
-                        
+
         # 2. Dynamic Position Sizing based on Health
         allow_new_buys = True
         dynamic_target_ratio = self.target_position_ratio
-        
+
         if len(current_positions) > 0 and losing_positions_count >= len(current_positions) / 2.0:
-            # Headwind period: More than half of old positions are weak. Stop new buys and reduce target ratio.
             allow_new_buys = False
             dynamic_target_ratio = max(0.3, self.target_position_ratio / 2.0)
             print(f"[{date}] 【逆风期风控】老仓表现恶劣 (弱势比例: {losing_positions_count}/{len(current_positions)})，停止开新仓，总仓位目标压降至 {dynamic_target_ratio*100:.0f}%")
-        
+
         for symbol, qty in current_positions.items():
             if symbol in position_costs and symbol in current_prices:
                 avg_cost = position_costs[symbol]
                 curr_price = current_prices[symbol]
-                
+
                 # Update highest price for trailing stop
                 if symbol not in self.highest_prices:
                     self.highest_prices[symbol] = curr_price
                 else:
                     self.highest_prices[symbol] = max(self.highest_prices[symbol], curr_price)
-                
+
                 highest_price = self.highest_prices[symbol]
-                
+
                 if avg_cost > 0:
                     pnl_ratio = (curr_price - avg_cost) / avg_cost
-                    
-                    # Trailing Stop Loss (for winning trades)
-                    if highest_price > avg_cost * 1.05:
+
+                    # Compute ATR for adaptive thresholds
+                    atr = self._compute_atr(symbol, date, data_loader)
+                    atr_pct = atr / avg_cost if atr else None
+
+                    # --- Tier 1: Take-Profit (tight trail after profit threshold) ---
+                    if pnl_ratio >= self.take_profit_activate:
                         drawdown_from_peak = (curr_price - highest_price) / highest_price
-                        if drawdown_from_peak <= trailing_stop_threshold:
-                            print(f"[{date}] Trailing Stop Triggered for {symbol}: Peak {highest_price:.2f}, Curr {curr_price:.2f} (Drawdown {drawdown_from_peak*100:.2f}%)")
+                        if drawdown_from_peak <= -self.take_profit_trail:
+                            print(f"[{date}] 🎯 Take-Profit {symbol}: +{pnl_ratio*100:.1f}%, Peak {highest_price:.2f}, Curr {curr_price:.2f} (回撤{drawdown_from_peak*100:.1f}%)")
                             symbols_to_sell.append(symbol)
                             continue
-                            
-                    # Accumulated Stop Loss
-                    if pnl_ratio <= stop_loss_threshold:
-                        print(f"[{date}] Accumulated Stop Loss Triggered for {symbol}: PnL {pnl_ratio*100:.2f}% (Cost: {avg_cost:.2f}, Curr: {curr_price:.2f})")
+
+                    # --- Tier 2: Normal Trailing Stop (ATR-based, activates at +5%) ---
+                    if highest_price > avg_cost * 1.05:
+                        if atr and atr_pct:
+                            trail_stop_price = highest_price - self.atr_trail_mult * atr
+                            if curr_price <= trail_stop_price:
+                                print(f"[{date}] ATR Trailing Stop {symbol}: Peak {highest_price:.2f}, Stop {trail_stop_price:.2f}, Curr {curr_price:.2f} (ATR={atr:.2f})")
+                                symbols_to_sell.append(symbol)
+                                continue
+                        else:
+                            drawdown_from_peak = (curr_price - highest_price) / highest_price
+                            if drawdown_from_peak <= fallback_trail:
+                                print(f"[{date}] Trailing Stop {symbol}: Drawdown {drawdown_from_peak*100:.1f}%")
+                                symbols_to_sell.append(symbol)
+                                continue
+
+                    # --- Tier 3: ATR-based Accumulated Stop Loss ---
+                    if atr and atr_pct:
+                        stop_price = avg_cost - self.atr_stop_mult * atr
+                        if curr_price <= stop_price:
+                            print(f"[{date}] ATR Stop Loss {symbol}: Cost {avg_cost:.2f}, Stop {stop_price:.2f}, Curr {curr_price:.2f} (ATR={atr:.2f}, PnL={pnl_ratio*100:.1f}%)")
+                            symbols_to_sell.append(symbol)
+                            continue
+                    elif pnl_ratio <= fallback_stop_loss:
+                        print(f"[{date}] Stop Loss {symbol}: PnL {pnl_ratio*100:.1f}% (Cost: {avg_cost:.2f}, Curr: {curr_price:.2f})")
                         symbols_to_sell.append(symbol)
                         continue
-                        
-                    # In headwind period, accelerate closing of weak positions (accelerated stop loss)
+
+                    # --- Headwind Accelerated Stop ---
                     if not allow_new_buys and pnl_ratio < -0.05:
-                        print(f"[{date}] Headwind Accelerated Stop Loss Triggered for {symbol}: PnL {pnl_ratio*100:.2f}%")
+                        print(f"[{date}] Headwind Accelerated Stop {symbol}: PnL {pnl_ratio*100:.1f}%")
                         symbols_to_sell.append(symbol)
                         continue
-                        
-                    # Single Day Drop
+
+                    # --- ATR-based Single Day Drop ---
                     try:
                         df_recent = data_loader.get_daily_data(symbol, start_date=(pd.to_datetime(date)-pd.Timedelta(days=5)).strftime('%Y%m%d'), end_date=date)
                         if len(df_recent) >= 2:
                             prev_close = df_recent.iloc[-2]['close']
                             daily_drop = (curr_price - prev_close) / prev_close
-                            if daily_drop <= daily_drop_threshold:
-                                print(f"[{date}] Daily Flush Stop Loss Triggered for {symbol}: Daily Drop {daily_drop*100:.2f}%")
+                            if atr:
+                                daily_atr_ratio = abs(daily_drop) / (atr / prev_close)
+                                if daily_atr_ratio > self.atr_daily_drop_mult:
+                                    print(f"[{date}] ATR Daily Drop {symbol}: {daily_drop*100:.1f}% ({daily_atr_ratio:.1f}x ATR)")
+                                    symbols_to_sell.append(symbol)
+                                    continue
+                            elif daily_drop <= fallback_daily_drop:
+                                print(f"[{date}] Daily Drop {symbol}: {daily_drop*100:.1f}%")
                                 symbols_to_sell.append(symbol)
                                 continue
                     except Exception:
@@ -317,9 +392,10 @@ class MLStrategy(BaseStrategy):
         valid_symbols = []
 
         # We need benchmark close for some factors
-        # Fetch enough history: min_listed_days (120) + buffer for rolling calculations (~80 for safety)
-        # This ensures stocks listed 120+ days ago have valid rows after dynamic_filter
-        lookback_days = max(220, self.dynamic_filter.min_listed_days + 100) if self.dynamic_filter else 220
+        # Fetch enough history: pandas-ta "all" strategy needs 255+ trading days for indicators like
+        # PVIe_255. 500 calendar days ~= 340 trading days, which is sufficient.
+        # Using the same lookback as training ensures consistent feature dimensions.
+        lookback_days = max(500, self.dynamic_filter.min_listed_days + 150) if self.dynamic_filter else 500
         benchmark_df = data_loader.get_daily_data("sh.000300",
                                                 start_date=(pd.to_datetime(date) - pd.Timedelta(days=lookback_days)).strftime('%Y%m%d'),
                                                 end_date=date)
@@ -351,14 +427,15 @@ class MLStrategy(BaseStrategy):
             elif class_name == 'BoardFactor':
                 params = {'encode_method': getattr(factor, 'encode_method', 'category')}
             elif class_name == 'FinancialFactor':
-                params = {'cache_dir': getattr(factor.repo, 'cache_dir', 'data/local_lake')}
+                params = {}
             elif class_name == 'FundFlowFactor':
-                params = {'cache_dir': getattr(factor.repo, 'cache_dir', 'data/local_lake')}
+                params = {}
             elif class_name == 'MarketFactor':
                 params = {'index_symbol': getattr(factor, 'index_symbol', 'sh.000300')}
             elif class_name == 'LabelGenerator':
                 params = {'horizon': getattr(factor, 'horizon', 5),
-                         'target_type': getattr(factor, 'target_type', 'regression')}
+                         'target_type': getattr(factor, 'target_type', 'regression'),
+                         'decay_weights': getattr(factor, 'decay_weights', None)}
             else:
                 # EventFactor, SubjectiveFactor, PatternFactor, TechnicalFactors: no params
                 params = {}
@@ -389,8 +466,10 @@ class MLStrategy(BaseStrategy):
 
         # Prepare tasks: (symbol, date, lookback_days, benchmark_df_dict, benchmark_index, dynamic_filter_config, feature_pipeline_config, cache_dir, cache_enabled, config_hash)
         tasks = []
+        # TEMPORARILY DISABLE CACHE to force fresh computation
+        cache_enabled = False
         for symbol in candidates:
-            tasks.append((symbol, date, lookback_days, benchmark_df_dict, benchmark_index, dynamic_filter_config, feature_pipeline_config, cache_dir, True, config_hash))
+            tasks.append((symbol, date, lookback_days, benchmark_df_dict, benchmark_index, dynamic_filter_config, feature_pipeline_config, cache_dir, cache_enabled, config_hash))
 
         # Parallel execution
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
@@ -436,21 +515,30 @@ class MLStrategy(BaseStrategy):
         # Form Cross-Section (each item is a Series, need to convert to single-row DataFrame)
         X_full = pd.concat([s.to_frame().T for s in latest_features_list])
 
+        print(f"[DEBUG {date}] After concat: X_full shape: {X_full.shape}, columns count: {len(X_full.columns)}")
+        print(f"[DEBUG {date}] X_full dtypes: {dict(X_full.dtypes.value_counts())}")
+
         # Fix: When Series has mixed types (including string columns like board_industry),
         # the entire Series becomes object dtype. After concat, ALL columns become object.
-        # Convert numeric columns back to proper numeric types.
+        # Convert numeric columns back to proper numeric types, but DON'T drop columns
+        # that have mixed types - instead fill non-convertible values with NaN (XGBoost handles NaN).
         for col in X_full.columns:
             if X_full[col].dtype == 'object':
-                # Try to convert to numeric
                 converted = pd.to_numeric(X_full[col], errors='coerce')
-                # Only keep if conversion worked (no NaN from coercion)
                 if not converted.isna().all():
                     X_full[col] = converted
+                else:
+                    X_full[col] = np.nan
+
+        print(f"[DEBUG {date}] After object->numeric conversion: X_full shape: {X_full.shape}, columns count: {len(X_full.columns)}")
+        print(f"[DEBUG {date}] X_full dtypes: {dict(X_full.dtypes.value_counts())}")
 
         # Apply Cross-Sectional Processor (MAD Clip & Z-Score)
         if self.processor:
             feature_cols = X_full.drop(columns=['open', 'high', 'low', 'close', 'volume', 'date', 'symbol'], errors='ignore').columns.tolist()
+            print(f"[DEBUG {date}] CrossSectionalProcessor input: {len(feature_cols)} feature cols")
             X_full = self.processor.process(X_full, feature_cols)
+            print(f"[DEBUG {date}] After CrossSectionalProcessor: X_full shape: {X_full.shape}")
 
         # Drop non-feature columns before prediction
         # Also drop string/object columns that XGBoost cannot handle
@@ -465,6 +553,10 @@ class MLStrategy(BaseStrategy):
         # DEBUG: trace X_pred columns
         print(f"[DEBUG {date}] X_pred shape: {X_pred.shape}, X_pred columns: {list(X_pred.columns)[:10]}...")
 
+        # Check for missing critical features
+        if 'benchmark_close' not in X_pred.columns:
+            print(f"[WARN {date}] benchmark_close NOT in X_pred! Available columns sample: {list(X_pred.columns)[:20]}")
+
         # Batch Predict
         try:
             scores = self.model.predict(X_pred)
@@ -477,7 +569,7 @@ class MLStrategy(BaseStrategy):
         # Sort by score descending
         predictions.sort(key=lambda x: x[1], reverse=True)
 
-        # --- Filter Illiquid / Limit Up Stocks ---
+        # --- Filter Illiquid / Limit Up / Suspended Stocks ---
         valid_predictions = []
         for sym, score in predictions:
             idx = valid_symbols.index(sym)
@@ -487,8 +579,23 @@ class MLStrategy(BaseStrategy):
             vol = orig_row.get('volume', 1)
             is_limit_up = row.get('sub_is_limit_up', 0)
             
-            if vol == 0 or is_limit_up == 1:
-                # print(f"[{date}] Skipping {sym} due to liquidity/limit-up risk (Score: {score:.4f})")
+            # Check if volume is extremely low or 0 (Suspended or highly illiquid)
+            if vol == 0 or pd.isna(vol):
+                # print(f"[{date}] Skipping {sym} due to suspension (Volume: 0)")
+                continue
+                
+            # Also check if the date of the latest feature actually matches the target date
+            # If the stock was suspended today, the 'latest' feature might be from days ago.
+            row_date = orig_row.name if isinstance(orig_row.name, (str, pd.Timestamp)) else None
+            # Compare YYYYMMDD formats
+            if row_date:
+                row_date_str = pd.to_datetime(row_date).strftime('%Y%m%d')
+                if row_date_str != pd.to_datetime(date).strftime('%Y%m%d'):
+                    # print(f"[{date}] Skipping {sym} due to stale data (Latest is {row_date_str}, expected {date})")
+                    continue
+                
+            if is_limit_up == 1:
+                # print(f"[{date}] Skipping {sym} due to limit-up risk (Score: {score:.4f})")
                 continue
                 
             valid_predictions.append((sym, score))
@@ -554,23 +661,50 @@ class MLStrategy(BaseStrategy):
                 
         # 4. Weight Allocation
         if self.weight_method == 'score':
-            # Assign weights proportional to prediction score
-            # Since scores from rank:pairwise can be anything (including negative or very small differences),
-            # we use softmax to convert them into meaningful probabilities/weights.
+            if not final_top_predictions:
+                print(f"[{date}] No predictions to allocate weights.")
+                return {}
             scores = np.array([x[1] for x in final_top_predictions])
-            # Subtract max for numerical stability
             exp_scores = np.exp(scores - np.max(scores))
             softmax_weights = exp_scores / np.sum(exp_scores)
-            
+
             target_weights = {final_top_predictions[i][0]: float(softmax_weights[i]) * dynamic_target_ratio for i in range(len(final_top_predictions))}
             print(f"[{date}] ML Selected with Score Weights: {target_weights}")
             return target_weights
-                
+
+        elif self.weight_method == 'inv_vol':
+            if not selected:
+                print(f"[{date}] No stocks selected for inv_vol weighting.")
+                return {}
+            # Compute 20-day annualized volatility for each selected stock
+            vols = {}
+            for sym in selected:
+                try:
+                    hist = data_loader.get_daily_data(
+                        sym,
+                        start_date=(pd.to_datetime(date) - pd.Timedelta(days=60)).strftime('%Y%m%d'),
+                        end_date=date)
+                    if len(hist) >= 15:
+                        daily_ret = hist['close'].pct_change().dropna()
+                        vol = daily_ret.tail(20).std()
+                    else:
+                        vol = 0.03  # default ~30% annualized
+                except Exception:
+                    vol = 0.03
+                vols[sym] = max(vol, 0.005)  # floor at 0.5% daily vol
+
+            inv_vols = {s: 1.0 / v for s, v in vols.items()}
+            total_inv = sum(inv_vols.values())
+            target_weights = {s: (inv_vols[s] / total_inv) * dynamic_target_ratio for s in selected}
+            print(f"[{date}] ML Selected with Inverse-Vol Weights: {target_weights}")
+            return target_weights
+
         # Default: Equal weight (enforce dynamic_target_ratio)
         if selected:
             w = dynamic_target_ratio / len(selected)
             target_weights = {sym: w for sym in selected}
             print(f"[{date}] ML Selected with Equal Weights: {target_weights}")
             return target_weights
-            
+
+        print(f"[{date}] No stocks selected.")
         return {}

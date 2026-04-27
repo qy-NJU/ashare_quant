@@ -15,6 +15,9 @@ models/saved/
 *.json
 *.model
 
+# Reports
+reports/
+
 # IDEs
 .vscode/
 .idea/

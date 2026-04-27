@@ -1,0 +1,92 @@
+# Quantitative Pipeline Configuration - Backtest Only Mode
+
+pipeline:
+  name: "V4_Backtest_Only_Pipeline"
+  mode: "backtest_only"  # 仅回测模式，跳过训练直接加载模型回测
+  
+  # 数据相关配置
+  data:
+    source: "LocalLakeRepository"
+    sync_source: "tushare" # or "baostock"
+    cache_dir: "data/local_lake"
+    
+    symbols: [] # 为空则使用 pool 过滤
+    pool:
+      board: "all"        
+      exchange: "all"     
+      exclude_st: true    
+      max_count: 0       
+
+  # 回测阶段不需要训练优化
+  training_optimization:
+    sample_rate: 1.0            
+    drop_middle: false           
+
+  # 特征预处理配置 (必须与训练时保持一致)
+  preprocessing:
+    dynamic_filter:       
+      enable: true
+      min_avg_turnover: 10000000  
+      min_listed_days: 120        
+    mad_clip: true        
+    z_score: true         
+
+  # 时间窗口配置 - 只需配置回测验证段
+  windows:
+    train: [] # 留空，回测模式不使用
+    backtest:
+      start: "2026-04-01"  # 回测起始日期
+      end: "2026-04-22"    # 回测结束日期
+
+  # 特征工程配置 (必须与原模型训练时完全一致)
+  features:
+    - name: "MarketFactor"
+      params:
+        index_symbol: "sh.000300"
+    - name: "SubjectiveFactor"  
+      params: {}
+    - name: "PatternFactor"     
+      params: {}
+    - name: "EventFactor"
+      params: {}
+    - name: "ReversalFactor"
+      params: {}
+    - name: "BoardFactor"
+      params:
+        encode_method: "category"
+    - name: "FinancialFactor"
+      params: {}
+    - name: "FundFlowFactor"
+      params: {}
+    - name: "PandasTAFactor"
+      params: 
+        strategy: "curated"
+    - name: "LabelGenerator"
+      params:
+        horizon: 7
+        target_type: "decay_weighted"
+
+  # 模型配置
+  model:
+    name: "XGBoostWrapper"
+    params: {}  # 加载模型不需要传递额外参数
+    load_path: "models/saved/config_xgb.json" # 加载训练后的模型
+
+  # 策略与回测配置
+  strategy:
+    name: "MLStrategy"
+    params:
+      top_k: 4
+      target_position_ratio: 0.6
+      rebalance_period: 3
+      use_market_filter: true     # 启用大盘风控，指数跌破20日线时空仓
+      max_turnover: 0.5
+      weight_method: "inv_vol"
+      # ATR adaptive stop-loss (stop = entry_price - N * ATR(14))
+      atr_stop_mult: 2.5
+      atr_daily_drop_mult: 2.0
+      atr_trail_mult: 3.0
+      # Take-profit: when profit > 15%, activate tight trailing stop at -8% from peak
+      take_profit_activate: 0.15
+      take_profit_trail: 0.08
+    initial_capital: 100000.0     # 提高初始资金，降低摩擦成本占比

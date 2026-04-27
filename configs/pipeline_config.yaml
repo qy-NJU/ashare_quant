@@ -2,12 +2,12 @@
 
 pipeline:
   name: "V4_Config_Driven_Pipeline"
-  mode: "inference"  # 重新训练模型，因为我们修改了 Label 的 horizon
+  mode: "train"  # 重新训练模型，修复 MarketFactor + benchmark_close 后
   
-  # 数据源配置
+  # 数据相关配置
   data:
-    sources:
-      - "BaostockSource"  # 已弃用，数据统一从 Local Data Lake 加载
+    source: "LocalLakeRepository"
+    sync_source: "tushare" # or "baostock"
     cache_dir: "data/local_lake"
     
     # 股票池配置 (如果指定了 symbols，则优先使用 symbols，忽略 pool 配置)
@@ -20,8 +20,8 @@ pipeline:
 
   # 训练加速与数据降噪优化
   training_optimization:
-    sample_rate: 0.5            # 随机降采样：仅使用 50% 的数据进行训练 (加快速度并防止过拟合，1.0为不采样)
-    drop_middle: true           # 截面极值采样：丢弃表现平庸的样本，迫使模型学习强势股和弱势股的本质区别
+    sample_rate: 1.0            # 使用全量数据训练
+    drop_middle: false          # 关闭极值采样
     drop_middle_threshold: 0.4  # 丢弃收益率排在中间 40% (即 30% ~ 70%) 的样本
 
   # 特征预处理配置 (去极值与标准化，减少市场噪音干扰)
@@ -38,10 +38,10 @@ pipeline:
     # 训练时间段: 2025年12月到2026年2月
     train:
       - start: "2024-01-01"
-        end: "2025-12-31"
+        end: "2026-03-31"
     # 回测/评测时间段: 2026年3月
     backtest:
-      start: "2026-04-15"
+      start: "2026-04-01"
       end: "2026-04-20"
 
   # 特征工程配置
@@ -55,6 +55,8 @@ pipeline:
       params: {}
     - name: "EventFactor"       # 引入事件驱动因子 (龙虎榜机构/游资净买入等)
       params: {}
+    - name: "ReversalFactor"   # 反转信号因子 (连续涨停计数、短期反转、量价背离、极端超买超卖)
+      params: {}
     - name: "BoardFactor"
       params:
         encode_method: "category"
@@ -64,17 +66,17 @@ pipeline:
       params: {}
     - name: "PandasTAFactor"
       params: 
-        strategy: "all"
+        strategy: "curated"
     - name: "LabelGenerator"
-      params: 
-        horizon: 15  # 预测未来15日收益率，让模型学习走趋势的“慢牛股”
+      params:
+        horizon: 7   # 预测未来7日收益率，与3日调仓周期更匹配，减少训练标签盲区
         # 目标类型可选:
         # 'regression' : 预测具体的收益率数值 (对应 model objective: reg:squarederror)
         # 'binary' : 预测涨跌 (只输出1和0，对应 model objective: binary:logistic)
         # 'classification_3' : 预测大涨(1)、平盘(0)、大跌(-1) (对应 model objective: multi:softmax, num_class: 3)
         # 'excess_return_binary' : 预测是否跑赢沪深300 (1表示跑赢，0表示跑输)
         # 'rank_pct' : 截面收益率百分比排名(0.0~1.0)，配合 rank:pairwise 效果最好，能解决二分类梯度为0的问题
-        target_type: "rank_pct"
+        target_type: "decay_weighted"
 
   # 模型配置
   model:
@@ -88,8 +90,9 @@ pipeline:
       subsample: 0.8              # 增加行采样，增加随机性防过拟合
       colsample_bytree: 0.8       # 增加列采样，增加随机性防过拟合
       min_child_weight: 5         # 叶子节点最小权重，防止过度切分
-      lambda: 1.0                 # L2 正则化
-      alpha: 0.5                  # L1 正则化
+      lambda_l2: 1.0                 # L2 正则化
+      alpha_l1: 0.5                  # L1 正则化
+      seed: 42                    # 固定随机种子，确保每次训练/预测结果一致
     num_boost_round: 100          # 学习率降低后，适当增加训练轮数以保证收敛
     save_path: "models/saved/config_xgb.json"
 
@@ -102,5 +105,12 @@ pipeline:
       rebalance_period: 3         # 调仓周期改为 3 天，降低交易摩擦成本，给股票时间跑出收益
       use_market_filter: false    # 关闭大盘趋势过滤，在 6 成仓位下保持策略持续运行
       max_turnover: 0.5           # 每次调仓最多换掉 50% 的仓位
-      weight_method: "score"      # 'equal' (等权) 或 'score' (按预测分数加权)
+      weight_method: "inv_vol"    # 'equal' / 'score' / 'inv_vol' (波动率倒数加权)
+      # ATR adaptive stop-loss parameters
+      atr_stop_mult: 2.5
+      atr_daily_drop_mult: 2.0
+      atr_trail_mult: 3.0
+      # Take-profit: when profit > 15%, activate tight trailing stop at -8% from peak
+      take_profit_activate: 0.15
+      take_profit_trail: 0.08
     initial_capital: 100000.0

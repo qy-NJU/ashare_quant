@@ -18,6 +18,7 @@ from features.factors.fund_flow import FundFlowFactor
 from features.factors.market import MarketFactor
 from features.factors.subjective import SubjectiveFactor
 from features.factors.pattern import PatternFactor
+from features.factors.reversal import ReversalFactor
 from features.factors.technical import LabelGenerator
 from features.processor import CrossSectionalProcessor, DynamicFilter
 from models.xgboost_model import XGBoostWrapper
@@ -32,7 +33,7 @@ def _compute_stock_features_batch(args):
     Processes a BATCH of stocks to amortize FeaturePipeline initialization cost.
     Must be at module level for multiprocessing pickle to work.
     """
-    stock_batch, start, end, include_label, dynamic_filter_config, feature_pipeline_config, benchmark_close, enable_filter, cache_dir = args
+    stock_batch, start, end, include_label, dynamic_filter_config, feature_pipeline_config, benchmark_df_dict, benchmark_index, enable_filter, cache_dir = args
 
     results = {}  # sym -> features_df or None
 
@@ -45,11 +46,27 @@ def _compute_stock_features_batch(args):
         repo = DataRepository(cache_dir=cache_dir)
         dynamic_filter = DynamicFilter(**dynamic_filter_config) if dynamic_filter_config and enable_filter else None
 
+        # Reconstruct benchmark DataFrame for MarketFactor
+        benchmark_df_worker = None
+        if benchmark_df_dict is not None and benchmark_index is not None:
+            benchmark_df_worker = pd.DataFrame(benchmark_df_dict, index=pd.DatetimeIndex(benchmark_index))
+            # Pre-compute index features for MarketFactor
+            benchmark_df_worker['idx_ret'] = benchmark_df_worker['close'].pct_change()
+            benchmark_df_worker['idx_ma20'] = benchmark_df_worker['close'].rolling(20).mean()
+            benchmark_df_worker['idx_trend'] = (benchmark_df_worker['close'] / benchmark_df_worker['idx_ma20']) - 1
+            benchmark_df_worker['idx_vol20'] = benchmark_df_worker['idx_ret'].rolling(20).std()
+
         # Reconstruct feature pipeline ONCE per batch (expensive, especially EventFactor loads all LHB data)
         factors = []
         for factor_info in feature_pipeline_config:
             factor_class = FACTOR_MAP[factor_info['class']]
-            factors.append(factor_class(**factor_info.get('params', {})))
+            factor_instance = factor_class(**factor_info.get('params', {}))
+
+            # Set up MarketFactor with pre-computed index data (same as _process_single_stock)
+            if factor_info['class'] == 'MarketFactor' and benchmark_df_worker is not None:
+                factor_instance.index_df = benchmark_df_worker
+
+            factors.append(factor_instance)
         feature_pipeline = FeaturePipeline(factors)
 
         for sym in stock_batch:
@@ -67,9 +84,11 @@ def _compute_stock_features_batch(args):
                         results[sym] = None
                         continue
 
-                # Merge benchmark
-                if benchmark_close is not None and not pd.isna(benchmark_close):
-                    df['benchmark_close'] = benchmark_close
+                # Merge benchmark_close as time-aligned series (not scalar)
+                if benchmark_df_worker is not None and 'close' in benchmark_df_worker.columns:
+                    # Align benchmark close to the stock's date index
+                    aligned_benchmark = benchmark_df_worker['close'].reindex(df.index, method='ffill')
+                    df['benchmark_close'] = aligned_benchmark
 
                 # Add symbol column
                 df['symbol'] = sym
@@ -171,7 +190,8 @@ class PipelineRunner:
                 params = {'index_symbol': getattr(factor, 'index_symbol', 'sh.000300')}
             elif class_name == 'LabelGenerator':
                 params = {'horizon': getattr(factor, 'horizon', 5),
-                         'target_type': getattr(factor, 'target_type', 'regression')}
+                         'target_type': getattr(factor, 'target_type', 'regression'),
+                         'decay_weights': getattr(factor, 'decay_weights', None)}
             else:
                 # EventFactor, SubjectiveFactor, PatternFactor, TechnicalFactors: no params
                 params = {}
@@ -188,7 +208,7 @@ class PipelineRunner:
         params = model_cfg.get('params', {})
         num_boost_round = model_cfg.get('num_boost_round', 50)  # 从配置读取，默认50
         if model_cfg['name'] == 'XGBoostWrapper':
-            model = XGBoostWrapper(params=params)
+            model = XGBoostWrapper(**params)
             model.num_boost_round = num_boost_round  # 存储以供后续使用
             return model
         else:
@@ -278,12 +298,11 @@ class PipelineRunner:
         # --- 1. PREDICT ONLY MODE ---
         if mode == 'predict_only':
             print("\n=== STARTING PREDICTION MODE ===")
-            
+
             # Load the model
             model_cfg = self.config['model']
             model_path = model_cfg.get('load_path', 'models/saved/config_xgb.json')
-            
-            import os
+
             if not os.path.exists(model_path):
                 print(f"Error: Model file not found at {model_path}")
                 return
@@ -312,14 +331,25 @@ class PipelineRunner:
             strategy = MLStrategy(name="YAML_Strategy", model=model, feature_pipeline=infer_pipeline, universe=symbols, 
                                   processor=processor, dynamic_filter=dynamic_filter, **strat_params)
                                   
-            # Fake a 'cash' holding just to trigger normal rebalance logic
-            current_positions = {}
+            # Load real portfolio data
+            portfolio_cfg = self.config.get('portfolio', {})
+            current_positions = portfolio_cfg.get('current_positions', {}) or {}
+            position_costs = portfolio_cfg.get('position_costs', {}) or {}
             current_prices = {}
-            position_costs = {}
+            
+            # Fetch latest prices for current positions to trigger stop-loss/take-profit
+            for sym in current_positions.keys():
+                try:
+                    df_latest = repo.get_daily_data(sym, target_date_clean, target_date_clean)
+                    if not df_latest.empty:
+                        current_prices[sym] = df_latest['close'].iloc[-1]
+                except Exception as e:
+                    print(f"Warning: Could not fetch latest price for {sym}: {e}")
             
             # Force days_since_rebalance so it actually predicts
             strategy.days_since_rebalance = strategy.rebalance_period + 1 
             
+            print("\n--- 正在分析老仓健康度 (止盈/止损检查) ---")
             target_weights = strategy.select_stocks(
                 target_date_clean, 
                 repo, 
@@ -328,22 +358,71 @@ class PipelineRunner:
                 position_costs=position_costs
             )
             
-            if not target_weights:
-                print("No stocks selected. Check market filters or data availability.")
-            else:
-                print(f"\n--- TOP STOCKS TO BUY FOR NEXT TRADING DAY ---")
-                print(f"Based on data at: {target_date}")
+            if target_weights is None:
+                target_weights = {}
+
+            print(f"\n--- TOP STOCKS TO BUY/HOLD FOR NEXT TRADING DAY ---")
+            print(f"Based on data at: {target_date}")
+            
+            available_capital = strat_cfg.get('available_capital', 100000.0)
+            print(f"Account Total Capital: ¥{available_capital:,.2f}")
+            
+            # Fetch stock names
+            try:
+                stock_list = repo.get_stock_list()
+                name_map = dict(zip(stock_list['symbol'], stock_list['name']))
+            except:
+                name_map = {}
                 
-                # Fetch stock names
-                try:
-                    stock_list = repo.get_stock_list()
-                    name_map = dict(zip(stock_list['symbol'], stock_list['name']))
-                except:
-                    name_map = {}
-                    
+            # Determine what to SELL
+            sell_symbols = [sym for sym in current_positions.keys() if sym not in target_weights]
+            if sell_symbols:
+                print(f"\n🔴 [SELL INSTRUCTIONS]")
+                for sym in sell_symbols:
+                    name = name_map.get(sym, "Unknown")
+                    qty = current_positions[sym]
+                    print(f"   Sell All: {sym:<8} | Name: {name:<10} | Qty: {qty}")
+            
+            # Determine what to BUY / HOLD
+            if not target_weights:
+                print("\n⚪ No stocks selected. Holding cash. (Market filter or no valid predictions)")
+            else:
+                print(f"\n🟢 [BUY/HOLD INSTRUCTIONS]")
                 for sym, weight in sorted(target_weights.items(), key=lambda x: x[1], reverse=True):
                     name = name_map.get(sym, "Unknown")
-                    print(f"⭐ Symbol: {sym:<8} | Name: {name:<10} | Target Weight: {weight*100:.1f}%")
+                    # Fetch latest price to calculate shares
+                    try:
+                        latest_data = repo.get_daily_data(sym, target_date_clean, target_date_clean)
+                        if not latest_data.empty:
+                            # Double check suspension status before recommending buy
+                            vol = latest_data['volume'].iloc[-1]
+                            if pd.isna(vol) or vol == 0:
+                                print(f"   [SUSPENDED] SKIP: {sym:<8} | Name: {name:<10} | Target Weight: {weight*100:5.1f}% | Reason: Stock is currently suspended (Volume is 0)")
+                                continue
+                                
+                            latest_price = latest_data['close'].iloc[-1]
+                            allocated_funds = available_capital * weight
+                            target_shares = int(allocated_funds / latest_price / 100) * 100
+                            
+                            # Check if it's already held
+                            current_shares = current_positions.get(sym, 0)
+                            shares_to_buy = target_shares - current_shares
+                            
+                            if shares_to_buy > 0:
+                                action = "BUY" if current_shares == 0 else "ADD"
+                                print(f"   {action}: {sym:<8} | Name: {name:<10} | Target Weight: {weight*100:5.1f}% | Est. Price: {latest_price:6.2f} | Need to Buy: {shares_to_buy:6d} shares")
+                            elif shares_to_buy < 0:
+                                print(f"   REDUCE: {sym:<8} | Name: {name:<10} | Target Weight: {weight*100:5.1f}% | Est. Price: {latest_price:6.2f} | Need to Sell: {-shares_to_buy:6d} shares")
+                            else:
+                                if current_shares == 0:
+                                    print(f"   SKIP: {sym:<8} | Name: {name:<10} | Target Weight: {weight*100:5.1f}% | Est. Price: {latest_price:6.2f} | Reason: Allocated funds not enough to buy 100 shares")
+                                else:
+                                    print(f"   HOLD: {sym:<8} | Name: {name:<10} | Target Weight: {weight*100:5.1f}% | Est. Price: {latest_price:6.2f} | Shares Match Target")
+                        else:
+                            print(f"   [SUSPENDED] SKIP: {sym:<8} | Name: {name:<10} | Target Weight: {weight*100:5.1f}% | Reason: Stock is currently suspended (No data for target date)")
+                            # Since this was skipped, we should conceptually reallocate this weight to other stocks or cash
+                    except Exception as e:
+                        print(f"   Error calculating shares for {sym}: {e}")
                     
             print("================================================\n")
             return
@@ -352,7 +431,7 @@ class PipelineRunner:
         elif mode == 'backtest_only':
             print("\n=== RUNNING BACKTEST ONLY MODE (skipping training) ===")
             # Load saved model
-            load_path = self.config['model'].get('save_path')
+            load_path = self.config['model'].get('load_path')
             if not load_path or not os.path.exists(load_path):
                 print(f"Error: saved model {load_path} not found. Please train first.")
                 return
@@ -406,7 +485,16 @@ class PipelineRunner:
             
             return
 
-        # --- TRAIN/BACKTEST MODE ---
+        # --- TRAIN/BACKTEST/INCREMENTAL MODE ---
+        
+        if mode == 'incremental_train':
+            print("\n=== RUNNING INCREMENTAL TRAIN MODE ===")
+            load_path = self.config['model'].get('load_path')
+            if not load_path or not os.path.exists(load_path):
+                print(f"Error: saved model {load_path} not found. Cannot do incremental training.")
+                return
+            model.load(load_path)
+            print(f"Loaded base model from {load_path}")
         
         # 2. Build Training Pipeline
         train_pipeline = self.build_feature_pipeline(include_label=True)
@@ -439,7 +527,9 @@ class PipelineRunner:
                     'min_listed_days': dynamic_filter.min_listed_days
                 }
             feature_pipeline_config = self._serialize_feature_pipeline_config(train_pipeline)
-            benchmark_close = benchmark_df['close'].iloc[-1] if not benchmark_df.empty else None
+            # Pass full benchmark time series (as dict+index for pickling) instead of scalar
+            benchmark_df_dict = benchmark_df[['close']].to_dict('list') if not benchmark_df.empty else None
+            benchmark_index = benchmark_df.index.tolist() if not benchmark_df.empty else None
 
             # Get absolute path for cache_dir to pass to workers
             data_cache_dir = self.config['data'].get('cache_dir', 'data/local_lake')
@@ -500,7 +590,7 @@ class PipelineRunner:
 
                 print(f"Computing features for {len(uncached_symbols)} uncached stocks in {len(batches)} batches ({num_workers} workers, ~{batch_size} stocks/batch)...")
 
-                tasks = [(batch, start, end, True, dynamic_filter_config, feature_pipeline_config, benchmark_close, enable_filter, data_cache_dir)
+                tasks = [(batch, start, end, True, dynamic_filter_config, feature_pipeline_config, benchmark_df_dict, benchmark_index, enable_filter, data_cache_dir)
                          for batch in batches]
 
                 completed_batches = 0
@@ -555,7 +645,7 @@ class PipelineRunner:
                 
                 # Check if we need to do cross-sectional percentage ranking for labels
                 label_gen_cfg = next((f for f in self.config['features'] if f['name'] == 'LabelGenerator'), None)
-                if label_gen_cfg and label_gen_cfg.get('params', {}).get('target_type') == 'rank_pct':
+                if label_gen_cfg and label_gen_cfg.get('params', {}).get('target_type') in ('rank_pct', 'decay_weighted'):
                     print("Applying cross-sectional percentage ranking to labels...")
                     y_full = y_full.groupby(level=0).rank(pct=True)
                     
@@ -588,7 +678,7 @@ class PipelineRunner:
                     # Calculate group sizes (number of stocks per date)
                     groups = X_full.groupby(X_full.index).size().values
                 
-                if i == 0:
+                if i == 0 and mode != 'incremental_train':
                     model.train(X_full, y_full, groups=groups,
                                 num_boost_round=getattr(model, 'num_boost_round', 50))
                 else:
@@ -666,8 +756,8 @@ class PipelineRunner:
         tasks = []
         for symbol in symbols:
             # We construct task parameter tuple matching what _compute_stock_features_batch expects
-            # format: (batch_symbols, start_date, end_date, is_train, dynamic_filter_config, feature_pipeline_config, benchmark_close, enable_filter, cache_dir)
-            tasks.append(([symbol], b_start_fetch, b_end, True, dynamic_filter_config, oos_pipeline_config, benchmark_close, enable_filter, data_cache_dir))
+            # format: (batch_symbols, start_date, end_date, is_train, dynamic_filter_config, feature_pipeline_config, benchmark_df_dict, benchmark_index, cache_dir)
+            tasks.append(([symbol], b_start_fetch, b_end, True, dynamic_filter_config, oos_pipeline_config, benchmark_df_dict, benchmark_index, enable_filter, data_cache_dir))
             
         # Parallel execution
         X_oos_list = []

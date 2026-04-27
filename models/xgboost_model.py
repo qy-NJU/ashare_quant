@@ -71,14 +71,50 @@ class XGBoostWrapper(BaseModel):
     - Training evaluation metrics (AUC, Error)
     - Native categorical feature support
     """
-    def __init__(self, params=None, name="XGBoost"):
+    def __init__(self, name: str = "XGBoost", 
+                 objective: str = 'reg:squarederror',
+                 max_depth: int = 4,
+                 eta: float = 0.1,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.8,
+                 min_child_weight: int = 1,
+                 lambda_l2: float = 1.0,
+                 alpha_l1: float = 0.0,
+                 seed: int = 42,
+                 **kwargs):
+        """
+        Initialize the XGBoost wrapper.
+        
+        Args:
+            name (str): Model name
+            objective (str): XGBoost objective function
+            max_depth (int): Maximum tree depth
+            eta (float): Learning rate
+            subsample (float): Subsample ratio of the training instances
+            colsample_bytree (float): Subsample ratio of columns when constructing each tree
+            min_child_weight (int): Minimum sum of instance weight needed in a child
+            lambda_l2 (float): L2 regularization term on weights
+            alpha_l1 (float): L1 regularization term on weights
+            seed (int): Random seed for reproducibility
+            **kwargs: Additional XGBoost parameters
+        """
         super().__init__(name)
-        self.params = params if params else {
-            'objective': 'reg:squarederror',
-            'max_depth': 4,
-            'eta': 0.1,
-            'verbosity': 0
+        
+        self.params = {
+            'objective': objective,
+            'max_depth': max_depth,
+            'eta': eta,
+            'subsample': subsample,
+            'colsample_bytree': colsample_bytree,
+            'min_child_weight': min_child_weight,
+            'lambda': lambda_l2,
+            'alpha': alpha_l1,
+            'seed': seed,
+            'tree_method': 'hist',  # use histogram-based algorithm for speed
+            'eval_metric': 'rmse'
         }
+        self.params.update(kwargs)
+        
         self.booster = None
         # Store training history for analysis
         self.train_history = []
@@ -282,9 +318,11 @@ class XGBoostWrapper(BaseModel):
             # Reorder and align features to match training
             missing_cols = [col for col in self.feature_names if col not in X_clean.columns]
             if missing_cols:
-                # Add missing columns with 0
-                for col in missing_cols:
-                    X_clean[col] = 0.0
+                # Add missing columns all at once to avoid DataFrame fragmentation warning
+                # Create a DataFrame of zeros with the missing columns and same index
+                missing_df = pd.DataFrame(0.0, index=X_clean.index, columns=missing_cols)
+                # Concatenate along columns
+                X_clean = pd.concat([X_clean, missing_df], axis=1)
                     
             # Drop extra columns
             X_clean = X_clean[self.feature_names]

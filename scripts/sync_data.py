@@ -3,6 +3,7 @@ import sys
 import pandas as pd
 import datetime
 import time
+from tqdm import tqdm
 
 # Add project root to sys.path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -39,20 +40,42 @@ def sync_fund_flow_for_symbol(symbol):
     except Exception as e:
         pass
 
-def sync_stock_list(source):
-    print("Syncing A-share stock list...")
+def sync_stock_list(source, force_update=False):
+    save_path = os.path.join(BASICS_DIR, 'stock_list.parquet')
+    
+    if not force_update and os.path.exists(save_path):
+        # Check if the file is less than 7 days old
+        file_mtime = os.path.getmtime(save_path)
+        if (time.time() - file_mtime) < 7 * 24 * 3600:
+            print(f"Loading stock list from local cache: {save_path} (Skipping API call)")
+            try:
+                return pd.read_parquet(save_path)
+            except Exception as e:
+                print(f"Failed to read local stock list: {e}. Will fetch from API.")
+                
+    print("Syncing A-share stock list from API...")
     df = source.get_stock_list()
     if df.empty:
         print("Failed to get stock list.")
         return pd.DataFrame()
         
-    save_path = os.path.join(BASICS_DIR, 'stock_list.parquet')
     df.to_parquet(save_path, engine='pyarrow', index=False)
     print(f"Stock list saved to {save_path} ({len(df)} stocks)")
     return df
 
-def sync_industry_mapping():
-    print("Syncing Industry Classification from Baostock...")
+def sync_industry_mapping(force_update=False):
+    save_path = os.path.join(BASICS_DIR, 'industry_map.parquet')
+    
+    if not force_update and os.path.exists(save_path):
+        file_mtime = os.path.getmtime(save_path)
+        if (time.time() - file_mtime) < 7 * 24 * 3600:
+            print(f"Loading industry mapping from local cache: {save_path} (Skipping API call)")
+            try:
+                return pd.read_parquet(save_path)
+            except Exception as e:
+                print(f"Failed to read local industry mapping: {e}. Will fetch from API.")
+
+    print("Syncing Industry Classification from Baostock API...")
     import baostock as bs
     
     # 注意：不要在这里单独 login/logout，因为 baostock 使用全局 socket 连接
@@ -65,16 +88,17 @@ def sync_industry_mapping():
     
     if rs.error_code != '0':
         print(f"Industry query failed: error_code={rs.error_code}, error_msg={rs.error_msg}")
-        return
+        return pd.DataFrame()
         
     if industry_data:
         df = pd.DataFrame(industry_data, columns=rs.fields)
         df['symbol'] = df['code'].apply(lambda x: x.split('.')[1] if '.' in x else x)
-        save_path = os.path.join(BASICS_DIR, 'industry_map.parquet')
         df[['symbol', 'industry']].to_parquet(save_path, engine='pyarrow', index=False)
         print(f"Industry mapping saved to {save_path} ({len(df)} records)")
+        return df[['symbol', 'industry']]
     else:
         print("No industry data found.")
+        return pd.DataFrame()
 
 def sync_financial_data_for_symbol(source, symbol, start_year=2015, end_year=None):
     if end_year is None:
@@ -213,57 +237,46 @@ def sync_lhb_data(start_date='20200101', end_date=None):
     except Exception as e:
         print(f"Failed to fetch LHB data: {e}")
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import cpu_count
 
-# Global variable to hold the worker-specific BaostockSource instance
-worker_source = None
-
-def _worker_init():
-    """
-    Initializer for ProcessPoolExecutor workers.
-    Each worker logs into Baostock exactly once when it starts.
-    """
-    global worker_source
-    import sys
-    import os
-    # Completely suppress baostock C++ stdout/stderr (e.g. Bad file descriptor errors on exit)
-    devnull = open(os.devnull, 'w')
-    sys.stdout = devnull
-    sys.stderr = devnull
-    
-    # We initialize it with auto_login=True (the default), so it logs in now
-    worker_source = BaostockSource()
-    
-    # Restore stdout for the worker so it can return results, but keep stderr suppressed
-    sys.stdout = sys.__stdout__
-
-def _sync_single_symbol(task_params):
-    """
-    Worker function to sync data for a single symbol.
-    Uses the globally initialized worker_source to avoid repeated login/logouts.
-    """
-    sym, start_date, end_date, start_year, end_year = task_params
-    global worker_source
-    
-    try:
-        sync_daily_data_for_symbol(worker_source, sym, start_date=start_date, end_date=end_date)
-        sync_financial_data_for_symbol(worker_source, sym, start_year=start_year, end_year=end_year)
-        sync_fund_flow_for_symbol(sym)
-        return (sym, True, None)
-    except Exception as e:
-        return (sym, False, str(e))
-
-def sync_all_daily_data(symbols_limit=None, start_date='2020-01-01'):
-    source = BaostockSource()
+def sync_all_daily_data(symbols_limit=None, start_date='2020-01-01', source_name='baostock', tushare_token=None, force_update=False):
+    if source_name.lower() == 'tushare':
+        from data.source.tushare_source import TushareSource
+        source = TushareSource(token=tushare_token)
+        print("Using Tushare as the primary data source.")
+    else:
+        from data.source.baostock_source import BaostockSource
+        source = BaostockSource()
+        print("Using Baostock as the primary data source.")
     
     # 1. Sync stock list
-    stock_df = sync_stock_list(source)
+    stock_df = sync_stock_list(source, force_update=force_update)
     if stock_df.empty:
         return
         
     # 2. Sync Industry Mapping
-    sync_industry_mapping()
+    save_path = os.path.join(BASICS_DIR, 'industry_map.parquet')
+    if not force_update and os.path.exists(save_path):
+        file_mtime = os.path.getmtime(save_path)
+        if (time.time() - file_mtime) < 7 * 24 * 3600:
+            print(f"Loading industry mapping from local cache: {save_path} (Skipping API call)")
+        else:
+            if source_name.lower() == 'tushare' and hasattr(source, 'get_industry_mapping'):
+                print("Syncing Industry Classification from Tushare API...")
+                ind_df = source.get_industry_mapping()
+                if not ind_df.empty:
+                    ind_df.to_parquet(save_path, engine='pyarrow', index=False)
+                    print(f"Industry mapping saved to {save_path} ({len(ind_df)} records)")
+            else:
+                sync_industry_mapping(force_update=True)
+    else:
+        if source_name.lower() == 'tushare' and hasattr(source, 'get_industry_mapping'):
+            print("Syncing Industry Classification from Tushare API...")
+            ind_df = source.get_industry_mapping()
+            if not ind_df.empty:
+                ind_df.to_parquet(save_path, engine='pyarrow', index=False)
+                print(f"Industry mapping saved to {save_path} ({len(ind_df)} records)")
+        else:
+            sync_industry_mapping(force_update=True)
         
     symbols = stock_df['symbol'].tolist()
     
@@ -280,52 +293,153 @@ def sync_all_daily_data(symbols_limit=None, start_date='2020-01-01'):
     start_year = int(start_date.split('-')[0])
     end_year = int(end_date.split('-')[0])
     
-    # Prepare tasks for multiprocessing
-    tasks = [(sym, start_date, end_date, start_year, end_year) for sym in symbols]
-    
-    # Logout the main thread's baostock connection before forking to avoid socket issues
-    try:
-        import baostock as bs
-        bs.logout()
-    except:
-        pass
+    if source_name.lower() == 'tushare' and hasattr(source, 'get_daily_data_batch'):
+        print(f"Starting BATCH sync for {len(symbols)} symbols using Tushare...")
+        success_count = 0
+        failed_symbols = []
         
-    # Use multiprocessing to speed up fetching
-    num_workers = min(cpu_count(), 16) # Cap workers to avoid overwhelming APIs
-    print(f"Using {num_workers} parallel workers...")
-    
+        # 1. Determine needed start_date for each symbol
+        from collections import defaultdict
+        date_groups = defaultdict(list)
+        
+        print("Checking local data status...")
+        for sym in tqdm(symbols, desc="Checking status"):
+            save_path = os.path.join(DAILY_K_DIR, f"{sym}.parquet")
+            needed_start = start_date
+            if os.path.exists(save_path):
+                try:
+                    local_df = pd.read_parquet(save_path)
+                    if not local_df.empty:
+                        last_date = local_df.index[-1] if isinstance(local_df.index, pd.DatetimeIndex) else pd.to_datetime(local_df['date']).max()
+                        last_date_str = pd.to_datetime(last_date).strftime('%Y-%m-%d')
+                        if last_date_str < end_date:
+                            needed_start = (pd.to_datetime(last_date) + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+                        else:
+                            needed_start = None # up to date
+                except:
+                    pass
+            date_groups[needed_start].append(sym)
+            
+        # 2. Process each date group
+        for needed_start, syms in date_groups.items():
+            if needed_start is None:
+                # Already up to date, just sync financials/funds
+                for sym in syms:
+                    try:
+                        sync_financial_data_for_symbol(source, sym, start_year=start_year, end_year=end_year)
+                        sync_fund_flow_for_symbol(sym)
+                        success_count += 1
+                    except Exception as e:
+                        failed_symbols.append((sym, str(e)))
+                continue
+                
+            # Calculate batch size for this needed_start
+            start_dt = pd.to_datetime(needed_start)
+            end_dt = pd.to_datetime(end_date)
+            days = max(1, (end_dt - start_dt).days)
+            trading_days = max(1, int(days * 250 / 365))
+            
+            # Max rows per request is 6000. Use 4000 as safety margin.
+            batch_size = max(1, int(4000 / trading_days))
+            batch_size = min(batch_size, 200) # Cap at 200 codes per request
+            
+            for i in tqdm(range(0, len(syms), batch_size), desc=f"Batch sync from {needed_start}"):
+                batch_symbols = syms[i:i+batch_size]
+                try:
+                    batch_data = source.get_daily_data_batch(batch_symbols, start_date=needed_start, end_date=end_date)
+                    
+                    for sym in batch_symbols:
+                        save_path = os.path.join(DAILY_K_DIR, f"{sym}.parquet")
+                        new_df = batch_data.get(sym, pd.DataFrame())
+                        
+                        local_df = pd.DataFrame()
+                        if os.path.exists(save_path):
+                            try:
+                                local_df = pd.read_parquet(save_path)
+                            except:
+                                pass
+                                
+                        if not new_df.empty:
+                            if not local_df.empty:
+                                if local_df.index.name == 'date':
+                                    local_df = local_df.reset_index()
+                                if new_df.index.name == 'date':
+                                    new_df = new_df.reset_index()
+                                combined_df = pd.concat([local_df, new_df])
+                                combined_df = combined_df.drop_duplicates(subset=['date'], keep='last')
+                                combined_df = combined_df.sort_values('date')
+                            else:
+                                combined_df = new_df.reset_index() if new_df.index.name == 'date' else new_df
+                            combined_df.to_parquet(save_path, engine='pyarrow', index=False)
+                            
+                        # Financials and fund flow
+                        sync_financial_data_for_symbol(source, sym, start_year=start_year, end_year=end_year)
+                        sync_fund_flow_for_symbol(sym)
+                        success_count += 1
+                        
+                    time.sleep(0.15) # Rate limit for Tushare
+                except Exception as e:
+                    for sym in batch_symbols:
+                        failed_symbols.append((sym, str(e)))
+                        
+        print(f"All sync tasks completed. Success: {success_count}, Failed: {len(failed_symbols)}")
+        if failed_symbols:
+            print(f"Sample failures: {failed_symbols[:5]}")
+        return
+
+    # Sequential sync (Fallback for baostock or if no batch method)
+    print(f"Starting sequential sync for {len(symbols)} symbols...")
+
     success_count = 0
     failed_symbols = []
-    
-    with ProcessPoolExecutor(max_workers=num_workers, initializer=_worker_init) as executor:
-        futures = {executor.submit(_sync_single_symbol, task): task[0] for task in tasks}
-        
-        count = 0
-        for future in as_completed(futures):
-            count += 1
-            sym = futures[future]
-            try:
-                _, success, error = future.result()
-                if success:
-                    success_count += 1
-                else:
-                    failed_symbols.append((sym, error))
-            except Exception as e:
-                failed_symbols.append((sym, str(e)))
+
+    for sym in tqdm(symbols, desc="Syncing", unit="stock"):
+        try:
+            sync_daily_data_for_symbol(source, sym, start_date=start_date, end_date=end_date)
+            sync_financial_data_for_symbol(source, sym, start_year=start_year, end_year=end_year)
+            sync_fund_flow_for_symbol(sym)
+            success_count += 1
+            
+            # Rate limiting for Tushare to avoid ban (approx 5 requests per second)
+            if source_name.lower() == 'tushare':
+                time.sleep(0.2)
                 
-            if count % 100 == 0 or count == len(symbols):
-                print(f"Progress: {count}/{len(symbols)} (Success: {success_count}, Failed: {len(failed_symbols)})...")
-                
+        except Exception as e:
+            failed_symbols.append((sym, str(e)))
+
     print(f"All sync tasks completed. Success: {success_count}, Failed: {len(failed_symbols)}")
     if failed_symbols:
         print(f"Sample failures: {failed_symbols[:5]}")
 
 if __name__ == "__main__":
     import argparse
+    import yaml
+    
+    # Try to load config
+    tushare_token = None
+    default_source = 'baostock'
+    try:
+        import config
+        tushare_token = getattr(config, 'TUSHARE_TOKEN', None)
+        if tushare_token == "your_tushare_token_here":
+            tushare_token = None
+    except ImportError:
+        pass
+        
+    try:
+        with open('configs/pipeline_config.yaml', 'r') as f:
+            cfg = yaml.safe_load(f)
+            default_source = cfg.get('data', {}).get('sync_source', 'baostock')
+    except:
+        pass
+        
     parser = argparse.ArgumentParser(description="Sync A-Share data to Local Data Lake")
     parser.add_argument('--limit', type=int, default=None, help='Limit number of symbols to sync (for testing)')
     parser.add_argument('--events_only', action='store_true', help='Only sync event data like LHB')
     parser.add_argument('--start_date', type=str, default='2020-01-01', help='Start date for syncing data (YYYY-MM-DD)')
+    parser.add_argument('--source', type=str, default=default_source, choices=['baostock', 'tushare'], help='Data source to use')
+    parser.add_argument('--token', type=str, default=tushare_token, help='Tushare token (if source is tushare)')
+    parser.add_argument('--force', action='store_true', help='Force update of basic info like stock list and industry map')
     args = parser.parse_args()
     
     # LHB data expects YYYYMMDD format
@@ -333,4 +447,4 @@ if __name__ == "__main__":
     sync_lhb_data(start_date=lhb_start_date)
     
     if not args.events_only:
-        sync_all_daily_data(symbols_limit=args.limit, start_date=args.start_date)
+        sync_all_daily_data(symbols_limit=args.limit, start_date=args.start_date, source_name=args.source, tushare_token=args.token, force_update=args.force)

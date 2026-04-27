@@ -29,7 +29,7 @@ class LabelGenerator(BaseFactor):
     """
     Generates labels for supervised learning (e.g., future return).
     """
-    def __init__(self, horizon=5, target_type='regression'):
+    def __init__(self, horizon=5, target_type='regression', decay_weights=None):
         """
         Args:
             horizon (int): Number of days to look ahead.
@@ -39,27 +39,42 @@ class LabelGenerator(BaseFactor):
                 - 'classification_3': 1 (up > 1%), 0 (flat), -1 (down < -1%).
                 - 'excess_return_binary': 1 if stock return > benchmark return, else 0.
                 - 'rank_pct': Cross-sectional percentage rank of returns (0.0 to 1.0). Best for rank:pairwise.
+                - 'decay_weighted': Multi-horizon decay-weighted composite label.
+            decay_weights (list): Weights for [1d, 3d, 5d, 7d] horizons. Default [0.4, 0.3, 0.2, 0.1].
         """
         super().__init__("LabelGenerator")
         self.horizon = horizon
         self.target_type = target_type
+        self.decay_weights = decay_weights or [0.4, 0.3, 0.2, 0.1]
+        self._horizons = [1, 3, 5, 7]
+
+    def _compute_return(self, df, h):
+        """Compute forward return over h days, using T+1 open as entry price."""
+        if 'open' not in df.columns:
+            future_close = df['close'].shift(-h)
+            entry_price = df['close']
+        else:
+            future_close = df['close'].shift(-h)
+            entry_price = df['open'].shift(-1)
+        return (future_close / entry_price) - 1
 
     def calculate(self, df):
-        # Calculate future return over horizon. 
+        if self.target_type == 'decay_weighted':
+            composite = pd.Series(0.0, index=df.index)
+            for w, h in zip(self.decay_weights, self._horizons):
+                ret_h = self._compute_return(df, h)
+                composite = composite + w * ret_h.fillna(0.0)
+            # Keep label only where the farthest horizon return is valid (no lookahead leak)
+            last_valid = self._compute_return(df, self._horizons[-1])
+            label = composite.where(last_valid.notna(), np.nan)
+            return label.rename(f'target_{self.horizon}d')
+
+        # Calculate future return over horizon.
         # To avoid lookahead bias and align with T+1 open execution:
         # Trade is executed at T+1 open, and evaluated at T+horizon close.
         # Return = (Close_{T+horizon} / Open_{T+1}) - 1
-        
-        if 'open' not in df.columns:
-            # Fallback if open price is not available
-            future_close = df['close'].shift(-self.horizon)
-            entry_price = df['close']
-        else:
-            future_close = df['close'].shift(-self.horizon)
-            entry_price = df['open'].shift(-1)
-            
-        raw_return = (future_close / entry_price) - 1
-        
+        raw_return = self._compute_return(df, self.horizon)
+
         if self.target_type == 'regression':
             label = raw_return
         elif self.target_type == 'rank_pct':

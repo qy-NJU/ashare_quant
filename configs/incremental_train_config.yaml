@@ -1,0 +1,97 @@
+# Quantitative Pipeline Configuration - Incremental Training Mode
+
+pipeline:
+  name: "V4_Incremental_Pipeline"
+  mode: "incremental_train"  # 增量训练模式
+  
+  # 数据相关配置
+  data:
+    source: "LocalLakeRepository"
+    sync_source: "tushare" # or "baostock"
+    cache_dir: "data/local_lake"
+    
+    symbols: [] # 为空则使用 pool 过滤
+    pool:
+      board: "all"        
+      exchange: "all"     
+      exclude_st: true    
+      max_count: 0       
+
+  # 训练加速与数据降噪优化
+  training_optimization:
+    sample_rate: 0.8            # 增量数据较少，提高采样率
+    drop_middle: true           
+    drop_middle_threshold: 0.4  
+
+  # 特征预处理配置
+  preprocessing:
+    dynamic_filter:       
+      enable: true
+      min_avg_turnover: 10000000  
+      min_listed_days: 120        
+    mad_clip: true        
+    z_score: true         
+
+  # 时间窗口配置 - 增量训练只需配置新的时间段
+  windows:
+    train:
+      - start: "2026-01-01"
+        end: "2026-03-31"
+    backtest:
+      start: "2026-04-01"  # 可选的回测验证段
+      end: "2026-04-20"
+
+  # 特征工程配置 (必须与原模型训练时完全一致)
+  features:
+    - name: "MarketFactor"
+      params:
+        index_symbol: "sh.000300"
+    - name: "SubjectiveFactor"  
+      params: {}
+    - name: "PatternFactor"     
+      params: {}
+    - name: "EventFactor"       
+      params: {}
+    - name: "BoardFactor"
+      params:
+        encode_method: "category"
+    - name: "FinancialFactor"
+      params: {}
+    - name: "FundFlowFactor"
+      params: {}
+    - name: "PandasTAFactor"
+      params: 
+        strategy: "all"
+    - name: "LabelGenerator"
+      params: 
+        horizon: 15
+        target_type: "rank_pct"
+
+  # 模型配置
+  model:
+    name: "XGBoostWrapper"
+    params:
+      objective: "rank:pairwise"
+      max_depth: 3
+      eta: 0.05
+      subsample: 0.8
+      colsample_bytree: 0.8
+      min_child_weight: 5
+      lambda_l2: 1.0
+      alpha_l1: 0.5
+      seed: 42
+    num_boost_round: 20           # 增量训练通常只需要较少的轮数
+    load_path: "models/saved/config_xgb.json"           # 读取原有模型
+    save_path: "models/saved/config_xgb_incremental.json" # 保存增量更新后的模型
+
+  # 策略与回测配置
+  strategy:
+    name: "MLStrategy"
+    params:
+      top_k: 4                    
+      target_position_ratio: 0.6  
+      rebalance_period: 3         
+      use_market_filter: false    
+      max_turnover: 0.5           
+      weight_method: "score"      
+    initial_capital: 100000.0

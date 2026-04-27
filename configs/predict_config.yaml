@@ -4,10 +4,10 @@ pipeline:
   name: "V4_Inference_Pipeline"
   mode: "predict_only"  # 新增的预测模式，只加载模型输出当天分数，不跑回测
   
-  # 数据源配置
+  # 数据相关配置
   data:
-    sources:
-      - "BaostockSource"
+    source: "LocalLakeRepository"
+    sync_source: "tushare" # or "baostock"
     cache_dir: "data/local_lake"
     
     symbols: [] # 为空则使用 pool 过滤
@@ -19,7 +19,7 @@ pipeline:
 
   # 预测日期配置 (设置你要计算信号的那天，通常是最新交易日)
   prediction:
-    target_date: "2026-04-20"  # 根据此日期的盘后数据，预测 T+1 日的 Top N 股票
+    target_date: "2026-04-24"  # 根据此日期的盘后数据，预测 T+1 日的 Top N 股票
 
   # 特征预处理配置 (必须与训练时保持一致)
   preprocessing:
@@ -51,12 +51,25 @@ pipeline:
     - name: "PandasTAFactor"
       params: 
         strategy: "all"
+    - name: "LabelGenerator"
+      params: 
+        horizon: 15
+        target_type: "rank_pct"
 
   # 模型配置 (用于加载已训练好的模型)
   model:
     name: "XGBoostWrapper"
-    params: {}  # XGBoostWrapper 不需要 params 就可以通过 load_path 加载
-    load_path: "models/saved/config_xgb.json" # 指定之前训练好的模型文件路径
+    params:
+      objective: "rank:pairwise"
+      max_depth: 3
+      eta: 0.05
+      subsample: 0.8
+      colsample_bytree: 0.8
+      min_child_weight: 5
+      lambda_l2: 1.0
+      alpha_l1: 0.5
+      seed: 42
+    load_path: "models/saved/config_xgb_incremental.json" # 指定之前训练好的模型文件路径
 
   # 选股策略配置 (决定输出多少只股票)
   strategy:
@@ -64,3 +77,22 @@ pipeline:
     params:
       top_k: 4                    # 输出排名前 4 的股票
       weight_method: "score"      # 按预测分数分配权重 (默认为 equal)
+      target_position_ratio: 0.6
+    available_capital: 20000.0   # 账户当前总资产（包含现金和股票市值，用于计算推荐买入股数）
+
+  # 当前实盘持仓 (用于触发动态止损、止盈和老仓健康度检查)
+  # 如果为空，系统将假设你当前空仓，直接输出新建仓的建议。
+  portfolio:
+    current_positions:
+      # "603933": 300
+      # "605555": 300
+      # "300052": 300
+      # "000404": 300
+      # "000001.SZ": 1000  # 股票代码: 持股数量
+    position_costs:
+      # "603933": 24.332
+      # "605555": 16.252
+      # "300052": 12.831
+      # "000404": 8.271
+      # "000001.SZ": 15.50 # 股票代码: 持仓成本价
+
