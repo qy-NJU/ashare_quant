@@ -1,0 +1,13 @@
+Loaded configuration for pipeline: V4_Config_Driven_Pipeline
+Building Data Layer...
+Using StockPoolManager with config: {'board': 'all', 'exchange': 'all', 'exclude_st': True, 'max_count': 0}
+Building Data Layer...
+StockPoolManager: Excluded 251 ST/Delisting stocks.
+StockPoolManager: Found 5181 stocks matching Criteria (Board: all, Exchange: all)
+Building Model...
+Building Feature Pipeline (include_label=True)...
+Failed to load local LHB data: '上榜日期'
+login success!
+Baostock login success!
+
+--- Training Phase 1: 20240101 to 20251231 ---

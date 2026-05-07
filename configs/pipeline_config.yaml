@@ -2,7 +2,7 @@
 
 pipeline:
   name: "V4_Config_Driven_Pipeline"
-  mode: "train"  # 重新训练模型，修复 MarketFactor + benchmark_close 后
+  mode: "backtest_only"  # 纯回测，跳过训练直接用已有模型
   
   # 数据相关配置
   data:
@@ -13,10 +13,11 @@ pipeline:
     # 股票池配置 (如果指定了 symbols，则优先使用 symbols，忽略 pool 配置)
     symbols: [] # 为空则使用 pool 过滤
     pool:
-      board: "all"        # 跑全市场 A 股
+      board: "all"        # 全市场板块
       exchange: "all"     
-      exclude_st: true    # 是否剔除 ST/*ST/退市股，过滤垃圾股防雷
-      max_count: 0       # 为了跑得快点，这里限制前 10 只（如果要全市场，设为0，但这会下载很久）
+      exclude_st: true    # 剔除 ST/*ST/退市股
+      max_count: 0        # 0 = 不限制数量
+      indices: "csi_all"  # 沪深300+中证500+中证1000成分股
 
   # 训练加速与数据降噪优化
   training_optimization:
@@ -24,25 +25,16 @@ pipeline:
     drop_middle: false          # 关闭极值采样
     drop_middle_threshold: 0.4  # 丢弃收益率排在中间 40% (即 30% ~ 70%) 的样本
 
-  # 特征预处理配置 (去极值与标准化，减少市场噪音干扰)
-  preprocessing:
-    dynamic_filter:       # 动态过滤僵尸股与次新股
-      enable: true
-      min_avg_turnover: 10000000  # 近20日日均成交额低于 1000万 的股票将被过滤 (防止流动性陷阱)
-      min_listed_days: 120        # 上市不满 120 天的次新股将被过滤 (防止新股异动噪音)
-    mad_clip: true        # 开启 MAD 横截面去极值 (过滤暴涨暴跌的异常噪音)
-    z_score: true         # 开启 Z-Score 横截面标准化 (消除大盘Beta带来的绝对值波动)
-
   # 时间窗口配置
   windows:
-    # 训练时间段: 2025年12月到2026年2月
+    # 训练时间段: 2024-01 到 2025-12 (2年训练)
     train:
       - start: "2024-01-01"
-        end: "2026-03-31"
-    # 回测/评测时间段: 2026年3月
+        end: "2025-12-31"
+    # 回测/评测时间段: 2026年1-4月 (到最新数据)
     backtest:
-      start: "2026-04-01"
-      end: "2026-04-20"
+      start: "2026-01-01"
+      end: "2026-04-30"
 
   # 特征工程配置
   features:
@@ -78,23 +70,89 @@ pipeline:
         # 'rank_pct' : 截面收益率百分比排名(0.0~1.0)，配合 rank:pairwise 效果最好，能解决二分类梯度为0的问题
         target_type: "decay_weighted"
 
-  # 模型配置
+  # ── 单模型模式 (CatBoost) ──
   model:
-    name: "XGBoostWrapper"
+    name: "CatBoostWrapper"
     params:
-      # 如果 target_type 是 excess_return_binary，可以使用 binary:logistic
-      # 如果 target_type 是 rank_pct，强烈建议使用 'rank:pairwise'
-      objective: "rank:pairwise"
-      max_depth: 3                # 降低树深度，防止过拟合 (原为4)
-      eta: 0.05                   # 降低学习率，让模型学习更平缓 (原为0.1)
-      subsample: 0.8              # 增加行采样，增加随机性防过拟合
-      colsample_bytree: 0.8       # 增加列采样，增加随机性防过拟合
-      min_child_weight: 5         # 叶子节点最小权重，防止过度切分
-      lambda_l2: 1.0                 # L2 正则化
-      alpha_l1: 0.5                  # L1 正则化
-      seed: 42                    # 固定随机种子，确保每次训练/预测结果一致
-    num_boost_round: 100          # 学习率降低后，适当增加训练轮数以保证收敛
-    save_path: "models/saved/config_xgb.json"
+      loss_function: "RMSE"
+      depth: 6
+      learning_rate: 0.05
+      subsample: 0.8
+      l2_leaf_reg: 3.0
+      random_seed: 42
+    num_boost_round: 100
+    save_path: "models/saved/catboost_single"
+    load_path: "models/saved/catboost_single"
+
+  # ── 集成模型 ──
+  # model:
+  #   ensemble:
+  #     - name: "XGBoostWrapper"
+  #       params:
+  #         objective: "rank:pairwise"
+  #         max_depth: 3
+  #         eta: 0.05
+  #         subsample: 0.8
+  #         colsample_bytree: 0.8
+  #         min_child_weight: 5
+  #         lambda_l2: 1.0
+  #         alpha_l1: 0.5
+  #         seed: 42
+  #       num_boost_round: 100
+  #     - name: "LightGBMWrapper"
+  #       params:
+  #         objective: "lambdarank"
+  #         num_leaves: 31
+  #         learning_rate: 0.05
+  #         subsample: 0.8
+  #         colsample_bytree: 0.8
+  #         min_child_samples: 50
+  #         reg_alpha: 0.5
+  #         reg_lambda: 1.0
+  #         seed: 42
+  #       num_boost_round: 100
+  #     - name: "CatBoostWrapper"
+  #       params:
+  #         loss_function: "RMSE"
+  #         depth: 6
+  #         learning_rate: 0.05
+  #         subsample: 0.8
+  #         l2_leaf_reg: 3.0
+  #         random_seed: 42
+  #       num_boost_round: 100
+  #   save_path: "models/saved/ensemble"
+
+  # 市场状态识别配置
+  market_state:
+    index_symbol: "sh.000300"     # 参考指数
+    ma_short: 20                  # 短期均线
+    ma_long: 60                   # 长期均线
+    ma_very_long: 200             # 超长期均线（用于判断牛熊分界）
+    crash_threshold: -0.05        # 暴跌阈值（单日跌幅超过5%视为恐慌）
+    rebound_threshold: 0.03       # 反弹确认阈值
+
+  # 风控配置
+  risk:
+    max_single_stock_weight: 0.15   # 单只股票最大权重
+    max_industry_weight: 0.30       # 单一行业最大权重
+    max_total_position: 0.80        # 总仓位上限
+    max_stocks_same_industry: 2     # 同行业最多持股数
+    liquidity_min_amount: 20000000  # 最小流动性要求（日均成交额2000万）
+    factor_ic_max_history: 60       # 因子IC历史记录长度
+    factor_ic_stale_threshold: 0.02 # 因子失效阈值（IC低于此值视为失效）
+    factor_ic_stale_days: 20        # 连续失效天数判定
+
+  # 特征预处理配置 (去极值与标准化，减少市场噪音干扰)
+  preprocessing:
+    dynamic_filter:       # 动态过滤僵尸股与次新股
+      enable: true
+      min_avg_turnover: 10000000  # 近20日日均成交额低于 1000万 的股票将被过滤 (防止流动性陷阱)
+      min_listed_days: 120        # 上市不满 120 天的次新股将被过滤 (防止新股异动噪音)
+    mad_clip: true        # 开启 MAD 横截面去极值 (过滤暴涨暴跌的异常噪音)
+    z_score: true         # 开启 Z-Score 横截面标准化 (消除大盘Beta带来的绝对值波动)
+    neutralize:           # 因子中性化配置
+      industry: false     # 是否行业中性化（需要数据中有board_industry列）
+      mcap: false         # 是否市值中性化（需要数据中有market_cap列）
 
   # 策略与回测配置
   strategy:
@@ -102,9 +160,10 @@ pipeline:
     params:
       top_k: 4                    # 持股 4 只，方便波段调仓
       target_position_ratio: 0.6  # 总仓位控制在 6 成，留出现金做缓冲
-      rebalance_period: 3         # 调仓周期改为 3 天，降低交易摩擦成本，给股票时间跑出收益
+      rebalance_period: 1         # 每天调仓（配合max_daily_swaps动态去弱留强）
       use_market_filter: false    # 关闭大盘趋势过滤，在 6 成仓位下保持策略持续运行
-      max_turnover: 0.5           # 每次调仓最多换掉 50% 的仓位
+      max_turnover: 1.0           # 不限换手，由max_daily_swaps控制
+      max_daily_swaps: 1          # 每天最多换1只，去弱留强控制成本
       weight_method: "inv_vol"    # 'equal' / 'score' / 'inv_vol' (波动率倒数加权)
       # ATR adaptive stop-loss parameters
       atr_stop_mult: 2.5

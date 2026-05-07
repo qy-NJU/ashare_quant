@@ -96,10 +96,17 @@ class ReversalFactor(BaseFactor):
 
         # Reversal intensity: negative correlation between past 5d and next 1d
         # Compute rolling correlation between daily returns and next-day returns
+        # SAFE: use vectorized operations instead of shift(-1) inside rolling().apply()
+        # which has ambiguous behavior across pandas versions
         daily_ret = df['close'].pct_change()
-        roll_corr = daily_ret.rolling(20).apply(
-            lambda x: x[:-1].corr(x.shift(-1)[:-1]) if len(x.dropna()) >= 10 else 0
-        )
+        # Compute corr(ret_{t-19:t-1}, ret_{t-18:t}) at each point t
+        # This is equivalent to 1-step lagged autocorrelation of daily returns
+        roll_mean_a = daily_ret.rolling(20).mean()
+        roll_mean_b = daily_ret.shift(1).rolling(20).mean()
+        roll_std_a = daily_ret.rolling(20).std()
+        roll_std_b = daily_ret.shift(1).rolling(20).std()
+        roll_cov = (daily_ret * daily_ret.shift(1)).rolling(20).mean() - roll_mean_a * roll_mean_b
+        roll_corr = roll_cov / (roll_std_a * roll_std_b).clip(lower=1e-9)
         result['rev_reversal_corr_20d'] = roll_corr.fillna(0)
 
         # ================================================================

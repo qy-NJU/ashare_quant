@@ -1,45 +1,47 @@
-# Quantitative Pipeline Configuration - Inference Mode (Predict Next Day)
+# Quantitative Pipeline Configuration - 预测下一个交易日
 
 pipeline:
   name: "V4_Inference_Pipeline"
-  mode: "predict_only"  # 新增的预测模式，只加载模型输出当天分数，不跑回测
+  mode: "predict_only"
   
-  # 数据相关配置
   data:
     source: "LocalLakeRepository"
-    sync_source: "tushare" # or "baostock"
+    sync_source: "tushare"
     cache_dir: "data/local_lake"
     
-    symbols: [] # 为空则使用 pool 过滤
+    symbols: []
     pool:
-      board: "all"        
-      exchange: "all"     
-      exclude_st: true    
-      max_count: 0       
+      board: "all"
+      exchange: "all"
+      exclude_st: true
+      max_count: 0
+      indices: "csi_all"  # 沪深300+中证500+中证1000成分股
 
-  # 预测日期配置 (设置你要计算信号的那天，通常是最新交易日)
+  # 预测日期（用最新交易日数据预测 T+1）
   prediction:
-    target_date: "2026-04-24"  # 根据此日期的盘后数据，预测 T+1 日的 Top N 股票
+    target_date: "2026-05-06"
 
-  # 特征预处理配置 (必须与训练时保持一致)
+  # 特征预处理（与训练一致）
   preprocessing:
-    dynamic_filter:       
+    dynamic_filter:
       enable: true
-      min_avg_turnover: 10000000  
-      min_listed_days: 120        
-    mad_clip: true        
-    z_score: true         
+      min_avg_turnover: 10000000
+      min_listed_days: 120
+    mad_clip: true
+    z_score: true
 
-  # 特征工程配置 (必须与训练时完全一致)
+  # 特征工程配置（与训练完全一致）
   features:
     - name: "MarketFactor"
       params:
         index_symbol: "sh.000300"
-    - name: "SubjectiveFactor"  
+    - name: "SubjectiveFactor"
       params: {}
-    - name: "PatternFactor"     
+    - name: "PatternFactor"
       params: {}
-    - name: "EventFactor"       
+    - name: "EventFactor"
+      params: {}
+    - name: "ReversalFactor"
       params: {}
     - name: "BoardFactor"
       params:
@@ -49,50 +51,46 @@ pipeline:
     - name: "FundFlowFactor"
       params: {}
     - name: "PandasTAFactor"
-      params: 
-        strategy: "all"
+      params:
+        strategy: "curated"
     - name: "LabelGenerator"
-      params: 
-        horizon: 15
-        target_type: "rank_pct"
+      params:
+        horizon: 7
+        target_type: "decay_weighted"
 
-  # 模型配置 (用于加载已训练好的模型)
+  # 模型（CatBoost 单模型）
   model:
-    name: "XGBoostWrapper"
+    name: "CatBoostWrapper"
     params:
-      objective: "rank:pairwise"
-      max_depth: 3
-      eta: 0.05
+      loss_function: "RMSE"
+      depth: 6
+      learning_rate: 0.05
       subsample: 0.8
-      colsample_bytree: 0.8
-      min_child_weight: 5
-      lambda_l2: 1.0
-      alpha_l1: 0.5
-      seed: 42
-    load_path: "models/saved/config_xgb_incremental.json" # 指定之前训练好的模型文件路径
+      l2_leaf_reg: 3.0
+      random_seed: 42
+    load_path: "models/saved/catboost_single"
 
-  # 选股策略配置 (决定输出多少只股票)
+  # 策略配置（与回测一致）
   strategy:
     name: "MLStrategy"
     params:
-      top_k: 4                    # 输出排名前 4 的股票
-      weight_method: "score"      # 按预测分数分配权重 (默认为 equal)
+      top_k: 4
       target_position_ratio: 0.6
-    available_capital: 20000.0   # 账户当前总资产（包含现金和股票市值，用于计算推荐买入股数）
+      rebalance_period: 1
+      max_daily_swaps: 1
+      weight_method: "inv_vol"
+      use_market_filter: false
+      max_turnover: 1.0
+      atr_stop_mult: 2.5
+      atr_daily_drop_mult: 2.0
+      atr_trail_mult: 3.0
+      take_profit_activate: 0.15
+      take_profit_trail: 0.08
+    available_capital: 100000.0
 
-  # 当前实盘持仓 (用于触发动态止损、止盈和老仓健康度检查)
-  # 如果为空，系统将假设你当前空仓，直接输出新建仓的建议。
+  # 当前持仓（空仓则输出新建仓建议）
   portfolio:
-    current_positions:
-      # "603933": 300
-      # "605555": 300
-      # "300052": 300
-      # "000404": 300
-      # "000001.SZ": 1000  # 股票代码: 持股数量
-    position_costs:
-      # "603933": 24.332
-      # "605555": 16.252
-      # "300052": 12.831
-      # "000404": 8.271
-      # "000001.SZ": 15.50 # 股票代码: 持仓成本价
-
+    current_positions: {
+    }
+    position_costs: {
+    }

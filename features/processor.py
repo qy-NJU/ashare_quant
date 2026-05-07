@@ -193,3 +193,65 @@ class CrossSectionalProcessor:
                 processed_df[col] = pd.to_numeric(processed_df[col], errors='coerce')
 
         return processed_df
+
+
+class Neutralizer:
+    """
+    Cross-sectional factor neutralization against industry and market-cap.
+    Removes systematic exposures so the model learns pure stock-specific alpha.
+
+    Two neutralization modes:
+      1. Industry neutralization: regress factor on industry dummies, keep residual
+      2. Market-cap neutralization: regress factor on log(market_cap), keep residual
+
+    Example:
+        >>> neutralizer = Neutralizer(industry_neutralize=True, mcap_neutralize=True)
+        >>> neutralized = neutralizer.neutralize(factor_df, industry_col='board_industry', mcap_col='market_cap')
+    """
+    def __init__(self, industry_neutralize=True, mcap_neutralize=True):
+        self.industry_neutralize = industry_neutralize
+        self.mcap_neutralize = mcap_neutralize
+
+    def neutralize(self, df, feature_cols, industry_col=None, mcap_col=None):
+        if not self.industry_neutralize and not self.mcap_neutralize:
+            return df
+
+        result = df.copy()
+
+        for col in feature_cols:
+            if col not in result.columns:
+                continue
+            if not pd.api.types.is_numeric_dtype(result[col]):
+                continue
+
+            residual = result[col].copy()
+
+            if self.industry_neutralize and industry_col and industry_col in result.columns:
+                industry_dummies = pd.get_dummies(result[industry_col], prefix='ind')
+                if not industry_dummies.empty and industry_dummies.shape[1] > 1:
+                    industry_dummies = industry_dummies.astype(float)
+                    from sklearn.linear_model import LinearRegression
+                    X_ind = industry_dummies.values
+                    y = residual.fillna(residual.median()).values.reshape(-1, 1)
+                    mask = ~np.isnan(y.flatten())
+                    if mask.sum() > 10 and X_ind.shape[1] > 1:
+                        reg = LinearRegression()
+                        reg.fit(X_ind[mask], y[mask])
+                        predicted = reg.predict(X_ind)
+                        residual = residual - predicted.flatten()
+
+            if self.mcap_neutralize and mcap_col and mcap_col in result.columns:
+                log_mcap = np.log(result[mcap_col].clip(lower=1))
+                from sklearn.linear_model import LinearRegression
+                X_mcap = log_mcap.fillna(log_mcap.median()).values.reshape(-1, 1)
+                y = residual.fillna(residual.median()).values.reshape(-1, 1)
+                mask = ~np.isnan(y.flatten())
+                if mask.sum() > 10:
+                    reg = LinearRegression()
+                    reg.fit(X_mcap[mask], y[mask])
+                    predicted = reg.predict(X_mcap)
+                    residual = residual - predicted.flatten()
+
+            result[col] = residual
+
+        return result

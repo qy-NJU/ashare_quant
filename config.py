@@ -7,4 +7,4 @@ import os
 
 # Tushare API Token
 # You can get it from https://tushare.pro/register
-TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "058107e25020ebc9be4568849327db2c2295d7e6606df6e25536a004")
+TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "879e1294dee35f3103429bc6cf4afc4b50057eec6e83e24ade3940d4")

@@ -6,3 +6,9 @@ seaborn
 tushare
 backtrader
 mplfinance
+xgboost
+scikit-learn
+scipy
+lightgbm
+catboost
+pyyaml

@@ -4,6 +4,21 @@ import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 import os
+import atexit
+
+# Module-level precomputed feature cache (populated by runner.py for backtest optimization)
+_PRE_COMPUTED_STOCK_FEATURES = None
+
+# Persistent process pool (avoids per-day spawn/import/numba-JIT overhead)
+_PERSISTENT_POOL = None
+_PERSISTENT_POOL_SIZE = min(mp.cpu_count(), 8)
+
+def _get_pool():
+    global _PERSISTENT_POOL
+    if _PERSISTENT_POOL is None:
+        _PERSISTENT_POOL = ProcessPoolExecutor(max_workers=_PERSISTENT_POOL_SIZE)
+        atexit.register(lambda: _PERSISTENT_POOL.shutdown(wait=False) if _PERSISTENT_POOL else None)
+    return _PERSISTENT_POOL
 
 
 def _process_single_stock(args):
@@ -12,6 +27,12 @@ def _process_single_stock(args):
     Must be at module level for multiprocessing pickle to work.
     """
     symbol, date, lookback_days, benchmark_df_dict, benchmark_index, dynamic_filter_config, feature_pipeline_config, cache_dir, cache_enabled, config_hash = args
+
+    # ── OPTIMIZATION: Precomputed stock features cache ──
+    if _PRE_COMPUTED_STOCK_FEATURES is not None:
+        key = f"{symbol}_{date}"
+        if key in _PRE_COMPUTED_STOCK_FEATURES:
+            return _PRE_COMPUTED_STOCK_FEATURES[key]
 
     try:
         # Import here to avoid circular imports and ensure fresh instances in each process
@@ -120,7 +141,8 @@ class MLStrategy(BaseStrategy):
     Strategy based on machine learning predictions.
     """
     def __init__(self, name, model, feature_pipeline, top_k=5, rebalance_period=20, universe=None,
-                 use_market_filter=False, max_turnover=1.0, weight_method='equal', processor=None, dynamic_filter=None, target_position_ratio=1.0, **kwargs):
+                 use_market_filter=False, max_turnover=1.0, weight_method='equal', processor=None, dynamic_filter=None, target_position_ratio=1.0,
+                 **kwargs):
         """
         Args:
             name (str): Strategy name.
@@ -169,6 +191,9 @@ class MLStrategy(BaseStrategy):
         self.take_profit_trail = kwargs.get('take_profit_trail', 0.08)
 
         self.days_since_rebalance = 0
+
+        # Dynamic rebalance: limit daily swaps to keep winners, cut losers
+        self.max_daily_swaps = kwargs.get('max_daily_swaps', 0)
 
         # State to track highest prices for trailing stop
         self.highest_prices = {}
@@ -467,32 +492,32 @@ class MLStrategy(BaseStrategy):
         # Prepare tasks: (symbol, date, lookback_days, benchmark_df_dict, benchmark_index, dynamic_filter_config, feature_pipeline_config, cache_dir, cache_enabled, config_hash)
         tasks = []
         # TEMPORARILY DISABLE CACHE to force fresh computation
-        cache_enabled = False
+        cache_enabled = True  # Enable cache for daily rebalance performance
         for symbol in candidates:
             tasks.append((symbol, date, lookback_days, benchmark_df_dict, benchmark_index, dynamic_filter_config, feature_pipeline_config, cache_dir, cache_enabled, config_hash))
 
-        # Parallel execution
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = {executor.submit(_process_single_stock, task): task[0] for task in tasks}
+        # Parallel execution (persistent pool avoids per-day spawn overhead)
+        executor = _get_pool()
+        futures = {executor.submit(_process_single_stock, task): task[0] for task in tasks}
 
-            for future in as_completed(futures):
-                symbol = futures[future]
-                try:
-                    result = future.result()
-                    if result is None:
-                        filtered_count['exception'] += 1
-                    elif 'error' in result:
-                        # Debug: log the error
-                        if len(filtered_count.get('errors', [])) < 5:
-                            filtered_count.setdefault('errors', []).append(f"{symbol}: {result['error']}")
-                        filtered_count['exception'] += 1
-                    else:
-                        if result.get('from_cache'):
-                            filtered_count['from_cache'] = filtered_count.get('from_cache', 0) + 1
-                        latest_features_list.append(result['features'])
-                        valid_symbols.append(result['symbol'])
-                except Exception as e:
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                result = future.result()
+                if result is None:
                     filtered_count['exception'] += 1
+                elif 'error' in result:
+                    # Debug: log the error
+                    if len(filtered_count.get('errors', [])) < 5:
+                        filtered_count.setdefault('errors', []).append(f"{symbol}: {result['error']}")
+                    filtered_count['exception'] += 1
+                else:
+                    if result.get('from_cache'):
+                        filtered_count['from_cache'] = filtered_count.get('from_cache', 0) + 1
+                    latest_features_list.append(result['features'])
+                    valid_symbols.append(result['symbol'])
+            except Exception as e:
+                filtered_count['exception'] += 1
 
         # Debug: count how far we got
         print(f"[DEBUG {date}] valid={len(valid_symbols)}, filtered={filtered_count}")
@@ -559,7 +584,11 @@ class MLStrategy(BaseStrategy):
 
         # Batch Predict
         try:
-            scores = self.model.predict(X_pred)
+            from models.ensemble import ModelEnsemble
+            if isinstance(self.model, ModelEnsemble):
+                scores = self.model.predict(X_pred, return_raw=True)
+            else:
+                scores = self.model.predict(X_pred)
         except Exception as e:
             print(f"[{date}] Prediction failed: {e}")
             return []
@@ -630,36 +659,64 @@ class MLStrategy(BaseStrategy):
             if sym not in selected:
                 selected.append(sym)
                 new_slots -= 1
-                
-        # We need to reconstruct top_predictions for score weighting
+
+        # 3. Turnover Control — Dynamic Rebalance: 去弱留强, limit daily swaps
+        if self.max_daily_swaps > 0 and current_positions:
+            current_symbols = set(current_positions.keys())
+            new_picks = set(selected)
+
+            # Stocks that would be sold/bought under full rebalance
+            to_sell = [s for s in current_symbols if s not in new_picks]
+            to_buy = [s for s in new_picks if s not in current_symbols]
+
+            if len(to_sell) > self.max_daily_swaps:
+                # Score all current holdings to find the WEAKEST ones
+                current_scores = {}
+                for p_sym, p_score in predictions:
+                    if p_sym in current_symbols:
+                        current_scores[p_sym] = p_score
+
+                # Sort old positions by score (lowest = weakest, sell first)
+                ranked_old = sorted(current_scores.items(), key=lambda x: x[1])
+                to_sell = [s for s, _ in ranked_old[:self.max_daily_swaps]]
+
+                # Sort new candidates by score (highest = strongest, buy first)
+                new_candidate_scores = [(s, sc) for s, sc in predictions if s in to_buy]
+                ranked_new = sorted(new_candidate_scores, key=lambda x: x[1], reverse=True)
+                to_buy = [s for s, _ in ranked_new[:self.max_daily_swaps]]
+
+                # Rebuild selected: keep old positions minus to_sell, add to_buy
+                selected = [s for s in current_symbols if s not in to_sell] + to_buy
+                # Audit: keep selected list at top_k size
+                if len(selected) > self.top_k:
+                    selected = selected[:self.top_k]
+
+                print(f"[{date}] 动态调仓: 卖出{to_sell}, 买入{to_buy}, 最终持仓{selected}")
+
+        elif self.max_turnover < 1.0 and current_positions:
+            # Simple logic: Keep existing top performers, only replace worst ones
+            current_symbols = set(current_positions.keys())
+            target_symbols = set(selected)
+
+            to_sell = current_symbols - target_symbols
+            to_buy = target_symbols - current_symbols
+
+            # Limit number of trades based on max_turnover
+            max_trades = max(1, int(len(current_positions) * self.max_turnover))
+
+            if len(to_sell) > max_trades:
+                # Need to reduce turnover. Keep some of the original positions
+                pass
+
+        # Recompute final_top_predictions for potentially modified selected list
         final_top_predictions = []
         for sym in selected:
-            # Find its score
             score = 0.01
             for p_sym, p_score in predictions:
                 if p_sym == sym:
                     score = p_score
                     break
             final_top_predictions.append((sym, score))
-
-        # 3. Turnover Control (Optional)
-        if self.max_turnover < 1.0 and current_positions:
-            # Simple logic: Keep existing top performers, only replace worst ones
-            current_symbols = set(current_positions.keys())
-            target_symbols = set(selected)
-            
-            to_sell = current_symbols - target_symbols
-            to_buy = target_symbols - current_symbols
-            
-            # Limit number of trades based on max_turnover
-            max_trades = max(1, int(len(current_positions) * self.max_turnover))
-            
-            if len(to_sell) > max_trades:
-                # Need to reduce turnover. Keep some of the original positions
-                # Ideally keep the ones with the highest scores among those we planned to sell
-                pass # Simplified for demo, full logic requires sorting current holdings by new score
-                
-        # 4. Weight Allocation
         if self.weight_method == 'score':
             if not final_top_predictions:
                 print(f"[{date}] No predictions to allocate weights.")

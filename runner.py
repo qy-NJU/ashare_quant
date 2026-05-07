@@ -20,11 +20,17 @@ from features.factors.subjective import SubjectiveFactor
 from features.factors.pattern import PatternFactor
 from features.factors.reversal import ReversalFactor
 from features.factors.technical import LabelGenerator
-from features.processor import CrossSectionalProcessor, DynamicFilter
+from features.processor import CrossSectionalProcessor, DynamicFilter, Neutralizer
+from features.factor_monitor import FactorICMonitor
 from models.xgboost_model import XGBoostWrapper
 from models.machine_learning import SklearnWrapper
+from models.lgbm_model import LightGBMWrapper
+from models.catboost_model import CatBoostWrapper
+from models.ensemble import ModelEnsemble
 from strategies.ml_strategy import MLStrategy
+from strategies.market_state import MarketStateRecognizer
 from backtest.engine import BacktestEngine
+from risk.controller import RiskController
 
 
 def _compute_stock_features_batch(args):
@@ -205,14 +211,40 @@ class PipelineRunner:
     def build_model(self):
         print("Building Model...")
         model_cfg = self.config['model']
+
+        # Ensemble mode: multiple model configs
+        if 'ensemble' in model_cfg:
+            print("Building Model Ensemble...")
+            ensemble_cfg = model_cfg['ensemble']
+            models = []
+            for m_cfg in ensemble_cfg:
+                name = m_cfg['name']
+                params = m_cfg.get('params', {})
+                num_boost_round = m_cfg.get('num_boost_round', 100)
+                if name == 'XGBoostWrapper':
+                    m = XGBoostWrapper(**params)
+                elif name == 'LightGBMWrapper':
+                    m = LightGBMWrapper(**params)
+                elif name == 'CatBoostWrapper':
+                    m = CatBoostWrapper(**params)
+                else:
+                    m = self._instantiate_class(name, params)
+                m.num_boost_round = num_boost_round
+                models.append(m)
+            return ModelEnsemble(models=models)
+
         params = model_cfg.get('params', {})
-        num_boost_round = model_cfg.get('num_boost_round', 50)  # 从配置读取，默认50
+        num_boost_round = model_cfg.get('num_boost_round', 50)
         if model_cfg['name'] == 'XGBoostWrapper':
             model = XGBoostWrapper(**params)
-            model.num_boost_round = num_boost_round  # 存储以供后续使用
-            return model
+        elif model_cfg['name'] == 'LightGBMWrapper':
+            model = LightGBMWrapper(**params)
+        elif model_cfg['name'] == 'CatBoostWrapper':
+            model = CatBoostWrapper(**params)
         else:
-            return self._instantiate_class(model_cfg['name'], params)
+            model = self._instantiate_class(model_cfg['name'], params)
+        model.num_boost_round = num_boost_round
+        return model
 
     def get_target_symbols(self):
         """Get the target symbols based on configuration."""
@@ -232,7 +264,8 @@ class PipelineRunner:
                 board=pool_cfg.get('board'),
                 exchange=pool_cfg.get('exchange'),
                 max_count=pool_cfg.get('max_count'),
-                exclude_st=pool_cfg.get('exclude_st', True)
+                exclude_st=pool_cfg.get('exclude_st', True),
+                indices=pool_cfg.get('indices'),
             )
             
         print("No symbols or pool config found. Returning empty list.")
@@ -291,9 +324,45 @@ class PipelineRunner:
         
         filter_cfg = prep_cfg.get('dynamic_filter', {})
         enable_filter = filter_cfg.get('enable', True)
-        min_turnover = filter_cfg.get('min_avg_turnover', 10000000) # Default 10 million RMB
-        min_listed_days = filter_cfg.get('min_listed_days', 120)    # Default half year
+        min_turnover = filter_cfg.get('min_avg_turnover', 10000000)
+        min_listed_days = filter_cfg.get('min_listed_days', 120)
         dynamic_filter = DynamicFilter(min_avg_turnover=min_turnover, min_listed_days=min_listed_days)
+
+        # Build neutralizer
+        neut_cfg = prep_cfg.get('neutralize', {})
+        neutralizer = Neutralizer(
+            industry_neutralize=neut_cfg.get('industry', False),
+            mcap_neutralize=neut_cfg.get('mcap', False)
+        )
+
+        # Build market state recognizer
+        state_cfg = self.config.get('market_state', {})
+        market_state_recognizer = MarketStateRecognizer(
+            index_symbol=state_cfg.get('index_symbol', 'sh.000300'),
+            ma_short=state_cfg.get('ma_short', 20),
+            ma_long=state_cfg.get('ma_long', 60),
+            ma_very_long=state_cfg.get('ma_very_long', 200),
+            crash_threshold=state_cfg.get('crash_threshold', -0.05),
+            rebound_threshold=state_cfg.get('rebound_threshold', 0.03),
+        )
+
+        # Build risk controller
+        risk_cfg = self.config.get('risk', {})
+        risk_controller = RiskController(
+            max_single_stock_weight=risk_cfg.get('max_single_stock_weight', 0.15),
+            max_industry_weight=risk_cfg.get('max_industry_weight', 0.30),
+            max_total_position=risk_cfg.get('max_total_position', 0.80),
+            max_stocks_same_industry=risk_cfg.get('max_stocks_same_industry', 2),
+            liquidity_min_amount=risk_cfg.get('liquidity_min_amount', 20_000_000),
+            market_state_recognizer=market_state_recognizer,
+        )
+
+        # Build factor IC monitor
+        factor_monitor = FactorICMonitor(
+            max_history=risk_cfg.get('factor_ic_max_history', 60),
+            stale_threshold=risk_cfg.get('factor_ic_stale_threshold', 0.02),
+            stale_days=risk_cfg.get('factor_ic_stale_days', 20),
+        )
         
         # --- 1. PREDICT ONLY MODE ---
         if mode == 'predict_only':
@@ -642,6 +711,13 @@ class PipelineRunner:
                 # Apply Cross-Sectional Processing (MAD + Z-Score) on Features
                 feature_cols = X_full.columns.tolist()
                 X_full = processor.process(X_full, feature_cols)
+
+                # Apply neutralization if configured
+                if neutralizer.industry_neutralize or neutralizer.mcap_neutralize:
+                    print("Applying factor neutralization...")
+                    industry_col = 'board_industry' if 'board_industry' in X_full.columns else None
+                    mcap_col = 'market_cap' if 'market_cap' in X_full.columns else None
+                    X_full = neutralizer.neutralize(X_full, feature_cols, industry_col=industry_col, mcap_col=mcap_col)
                 
                 # Check if we need to do cross-sectional percentage ranking for labels
                 label_gen_cfg = next((f for f in self.config['features'] if f['name'] == 'LabelGenerator'), None)
@@ -666,7 +742,16 @@ class PipelineRunner:
                 
                 # If using ranking objective, we need groups (query structure)
                 groups = None
-                if 'rank:' in model.params.get('objective', ''):
+                _need_ranking_groups = False
+                if isinstance(model, ModelEnsemble):
+                    for m in model.models:
+                        if hasattr(m, 'params') and 'rank:' in str(m.params.get('objective', '')):
+                            _need_ranking_groups = True
+                            break
+                else:
+                    _need_ranking_groups = 'rank:' in str(model.params.get('objective', ''))
+                
+                if _need_ranking_groups:
                     # For ranking, data must be grouped by date (query)
                     # We need to sort by date first to ensure contiguous groups
                     combined = pd.concat([X_full, y_full], axis=1)
@@ -679,13 +764,26 @@ class PipelineRunner:
                     groups = X_full.groupby(X_full.index).size().values
                 
                 if i == 0 and mode != 'incremental_train':
-                    model.train(X_full, y_full, groups=groups,
-                                num_boost_round=getattr(model, 'num_boost_round', 50))
+                    if isinstance(model, ModelEnsemble):
+                        model.train_all(X_full, y_full, groups=groups,
+                                        num_boost_round=getattr(model.models[0], 'num_boost_round', 100) if model.models else 100)
+                    else:
+                        model.train(X_full, y_full, groups=groups,
+                                    num_boost_round=getattr(model, 'num_boost_round', 50))
                 else:
-                    model.partial_train(X_full, y_full, groups=groups)
+                    if isinstance(model, ModelEnsemble):
+                        for m in model.models:
+                            m.partial_train(X_full, y_full, groups=groups)
+                    else:
+                        model.partial_train(X_full, y_full, groups=groups)
                     
                 # Evaluate on training set
-                train_preds = model.predict(X_full)
+                if isinstance(model, ModelEnsemble):
+                    combined_preds, model_preds, weights = model.predict(X_full)
+                    train_preds = combined_preds
+                    print(f"[Ensemble] Training weights: {weights}")
+                else:
+                    train_preds = model.predict(X_full)
                 
                 try:
                     from analysis import ModelEvaluator
@@ -715,8 +813,12 @@ class PipelineRunner:
         # Save Model
         save_path = self.config['model'].get('save_path')
         if save_path:
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            model.save(save_path)
+            if isinstance(model, ModelEnsemble):
+                ensemble_dir = save_path
+                model.save(ensemble_dir)
+            else:
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                model.save(save_path)
 
         # --- EVALUATE ON OOS (Backtest) DATA ---
         backtest_win = self.config['windows']['backtest']
@@ -802,7 +904,16 @@ class PipelineRunner:
             X_oos_full = processor.process(X_oos_full, feature_cols)
             
             # Predict
-            oos_preds = model.predict(X_oos_full)
+            if isinstance(model, ModelEnsemble):
+                oos_preds, oos_model_preds, oos_weights = model.predict(X_oos_full)
+                print(f"[Ensemble] OOS weights: {oos_weights}")
+                # Track IC per model on OOS
+                for m_name, m_preds in oos_model_preds.items():
+                    model.update_ic_tracking(
+                        {m_name: m_preds}, y_oos_full.values, date='oos'
+                    )
+            else:
+                oos_preds = model.predict(X_oos_full)
             
             # Calculate metrics
             from scipy.stats import spearmanr
@@ -854,7 +965,31 @@ class PipelineRunner:
 
         # Run Engine
         engine = BacktestEngine(strategy, repo, initial_capital=strat_cfg.get('initial_capital', 100000.0))
+
+        # Log market state before backtest
+        state = market_state_recognizer.recognize(b_end, repo)
+        print(f"\n[Market State] {state} on {b_end}")
+        reduction, reason = market_state_recognizer.should_reduce_position(b_end, repo)
+        if reduction > 0:
+            print(f"[Risk] Position reduction needed: {reduction*100:.0f}% due to {reason}")
+
         results = engine.run(b_start, b_end)
+
+        # Factor IC monitoring summary
+        if isinstance(model, ModelEnsemble) and model.ic_history:
+            print("\n[Factor IC Monitor] Model IC History:")
+            for m_name, history in model.ic_history.items():
+                recent_ics = [h['ic'] for h in history[-5:]]
+                print(f"  {m_name}: recent ICs = {[f'{ic:.4f}' for ic in recent_ics]}")
+
+        # Post-trade risk analysis
+        if engine.trade_log:
+            risk_summary = risk_controller.post_trade_analysis(
+                engine.portfolio_history, engine.trade_log
+            )
+            print(f"\n[Risk Analysis] Sharpe: {risk_summary.get('sharpe', 0):.2f}, "
+                  f"MaxDD: {risk_summary.get('max_drawdown', 0):.2%}, "
+                  f"WinRate: {risk_summary.get('win_rate', 0):.1%}")
         
         # Export Trades
         os.makedirs('data/backtest', exist_ok=True)
